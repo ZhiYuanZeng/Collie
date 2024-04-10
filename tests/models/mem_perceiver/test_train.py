@@ -15,6 +15,7 @@ config = CollieConfig.from_pretrained("huggyllama/llama-7b",
 # config.dp_size = 8
 # config.pp_size = 1
 config.num_hidden_layers=2 # reduce model size
+config.checkpointing = False
 model = LlamaForCausalLM(config=config)
 
 batch_size=1
@@ -32,6 +33,7 @@ tokens=torch.zeros(batch_size, seq_len).long().cuda()
 attention_mask=torch.zeros(seq_len, seq_len).long().cuda()
 
 mem_perceiver = MemPerceiver(
+    config=config,
     model=model, 
     num_layers=num_layers, 
     query_len=query_len, 
@@ -39,11 +41,12 @@ mem_perceiver = MemPerceiver(
     d_model=d_model, 
     d_ffn=d_ffn, 
     num_heads=num_heads, 
-    chunk_size=chunk_size).cuda()
+    chunk_size=chunk_size)
+mem_perceiver = mem_perceiver.cuda()
 mem_perceiver.train()
 
 with autocast():
     model_outputs = mem_perceiver(tokens, attention_mask)
 logits = model_outputs.logits # (bsz, seq_len, vocab)
-loss = logits[:, :, 0].mean()
+loss = logits.mean()
 loss.backward()
