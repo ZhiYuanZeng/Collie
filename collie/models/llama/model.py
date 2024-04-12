@@ -238,8 +238,9 @@ class LlamaLayer(nn.Module):
             query = torch.cat([past_key, query], dim=1)
             key = torch.cat([past_key, key], dim=1)
             value = torch.cat([past_value, value], dim=1)
+        assert key.requires_grad and value.requires_grad
         new_layer_past = None
-        if self.use_cache and not self.training:
+        if self.use_cache: # TODO: 删除了not self.training的判断，但是有问题，因为这个调整只适合perceiver，而我们改了llama本身的代码
             # 调整成和 hf 兼容的格式，方便 prefix tuning
             if self.config.peft_config and self.config.peft_config.peft_type == "PREFIX_TUNING":
                 present_key = key.reshape(*key.shape[:-1], -1, 2)\
@@ -409,7 +410,7 @@ class LlamaModel(nn.Module):
 class LlamaForCausalLM(CollieModelForCausalLM):
     base_model_prefix = "model"
 
-    def __init__(self, config: CollieConfig) -> None:
+    def __init__(self, config: CollieConfig, **kwargs) -> None:
         super().__init__(config)
         self.model = LlamaModel(config)
         self.lm_head = ColumnParallelLinearWithoutBias(
