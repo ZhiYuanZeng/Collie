@@ -39,15 +39,11 @@ from collie.models.llama import LlamaForCausalLM, LlamaLayer
 from typing import Any
 
 # TODO:
+# implement from_pretrained, load_state_dict, save_state_dict
+# 支持不定长的inputs (inference)
+# support backward with checkpointing
 # support recurrent compression
 # support inference with long generation (compress on-the-fly)
-
-class Pass(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-    
-    def forward(self, x):
-        return x
 
 class PerceiverLayer(nn.Module):
     def __init__(self, d_query, d_model, num_heads, d_ffn) -> None:
@@ -102,15 +98,16 @@ class PerceiverLayer(nn.Module):
 
     def forward(self, compressed_k, compressed_v, keys, values):
         # compress keys to compressed_k, compress values to compressed_v
-        compressed_k = self._forward(compressed_k, keys, self.k_cross_attention)
-        compressed_v = self._forward(compressed_v, values, self.v_cross_attention)
+        compressed_k = self._forward(compressed_k, keys, key_forward=True)
+        compressed_v = self._forward(compressed_v, values, key_forward=False)
         return compressed_k, compressed_v
 
-class MemPerceiver(nn.Module):
-    def __init__(self, model: torch.nn.Module, num_layers, query_len, d_query, d_model, d_ffn, num_heads, chunk_size):
+class MemPerceiver(CollieModelForCausalLM):
+    def __init__(self, config, model: torch.nn.Module, num_layers, query_len, d_query, d_model, d_ffn, num_heads, chunk_size):
         # cross-attention+ffn
         # soft query tokens at each layer
-        super().__init__()
+        super().__init__(config)
+
         self.model = model
         for p in self.model.parameters():
             p.requires_grad = False
@@ -120,9 +117,22 @@ class MemPerceiver(nn.Module):
         self.k_query_embed = nn.Parameter(torch.zeros(query_len, d_query))
         self.v_query_embed = nn.Parameter(torch.zeros(query_len, d_query))
         self.perceiver_layers = nn.ModuleList(
-            [PerceiverLayer(d_query=d_query, d_model=d_model, d_ffn=d_ffn, num_heads=num_heads) for i in range(num_layers)])
+            [PerceiverLayer(d_query=d_query, d_model=d_model, d_ffn=d_ffn, num_heads=num_heads) for _ in range(num_layers)])
         self.output_key_projections = nn.ModuleList([nn.Linear(d_query, d_model) for _ in range(num_layers)])
         self.output_value_projections = nn.ModuleList([nn.Linear(d_query, d_model) for _ in range(num_layers)])
+
+    @classmethod
+    def from_config(cls, config, model):
+        kwargs = config.mem_perceiver_config
+        kwargs['model'] = model
+        # num_layers=config.mem_perceiver_config['num_layers'] 
+        # query_len=config.mem_perceiver_config['query_len'] 
+        # d_query=config.mem_perceiver_config['d_query'] 
+        # d_model=config.mem_perceiver_config['d_model'] 
+        # d_ffn=config.mem_perceiver_config['d_ffn'] 
+        # num_heads=config.mem_perceiver_config['num_heads'] 
+        # chunk_size=config.mem_perceiver_config['chunk_size']
+        return super().from_config(config, **kwargs)
 
     def compress(self, keys, values):
         # output compressed kv_cachee
@@ -140,7 +150,7 @@ class MemPerceiver(nn.Module):
             compressed_k, compressed_v = layer(compressed_k, compressed_v, k, v)
 
             output_compressed_k = self.output_key_projections[i](compressed_k)
-            output_compressed_v = self.output_key_projections[i](compressed_v)
+            output_compressed_v = self.output_value_projections[i](compressed_v)
 
             compressed_k_layers.append(output_compressed_k.reshape(bsz, self.query_len, num_heads, head_dim))
             compressed_v_layers.append(output_compressed_v.reshape(bsz, self.query_len, num_heads, head_dim))
@@ -165,15 +175,16 @@ class MemPerceiver(nn.Module):
         else
             do compress
         """
-        chunked_input_ids = torch.split(input_ids, self.chunk_size, dim=1) # TODO: 支持长度无法被均分的情况
-        num_chunks = len(chunked_input_ids)
-        chunked_attention_mask = [attention_mask[i*self.chunk_size:(i+1)*self.chunk_size, i*self.chunk_size:(i+1)*self.chunk_size] 
-                                  for i in range(num_chunks)]
-        
-        cached_llm_outpus = []
         seq_len = input_ids.shape[1]
         
-        if seq_len > 1:
+        if seq_len > self.chunk_size:
+            chunked_input_ids = torch.split(input_ids, self.chunk_size, dim=1) # TODO: 支持长度无法被均分的情况
+            chunked_attention_mask = torch.split(attention_mask, self.chunk_size, dim=1)
+            num_chunks = len(chunked_input_ids)
+            
+            cached_llm_outpus = []
+
+            print("compress prompt...", flush=True)
             # compress the kv cache of prompt
             assert past_key_values is None
             cached_compressed_kv = None
@@ -181,6 +192,7 @@ class MemPerceiver(nn.Module):
                 # is_grad_enabled = torch.is_grad_enabled()
                 # if i == 0:
                 #     torch.set_grad_enabled(False)
+                # print(f'input shape: {chunked_input_ids[i].shape}, {chunked_attention_mask[i].shape}, {attention_mask.shape}')
                 model_outputs = self.model(chunked_input_ids[i], chunked_attention_mask[i], past_key_values=cached_compressed_kv)
 
                 # torch.set_grad_enabled(is_grad_enabled)
@@ -188,6 +200,8 @@ class MemPerceiver(nn.Module):
                 kv_cache = model_outputs.past_key_values # kv_cache is list of tuple: [(key of layer0, value of layer0), ...]
                 keys, values = [kv[0] for kv in kv_cache], [kv[1] for kv in kv_cache]
                 compressed_keys, compressed_values = self.compress(keys, values)
+                
+                assert compressed_keys[0].requires_grad and compressed_values[0].requires_grad
                 cached_llm_outpus.append(model_outputs)
                 # if i!=0:
                 #     cached_llm_outpus.append(model_outputs) # drop the first rank, since the first chunk does not use compressed memory
@@ -197,10 +211,10 @@ class MemPerceiver(nn.Module):
                     cached_compressed_kv = [
                         torch.cat([cached_kv, torch.stack([ck,cv], dim=0)], dim=2)
                         for cached_kv, ck, cv in zip(cached_compressed_kv, compressed_keys, compressed_values)]
-
+                
             accum_logits = torch.cat([o.logits for o in cached_llm_outpus], dim=1) # batch_size, seq_len
+            # TODO: accumulate hidden states
             # print(f"hidden states shape: {cached_llm_outpus[0][0].shape}, {cached_llm_outpus[0][1].shape}, {cached_llm_outpus[0][2].shape}")
-            # print(f"{accum_logits.shape=}")
             # accum_hidden_states = torch.cat([o.hidden_states for o in cached_llm_outpus], dim=1) # batch_size, seq_len, d_model
             lm_output = CausalLMOutputWithPast(
                 loss=None,
@@ -212,8 +226,16 @@ class MemPerceiver(nn.Module):
             return lm_output
         
         else:
+            print("incremental decoding...", flush=True)
             # incremental decoding
             assert past_key_values is not None
-            return self.model(chunked_input_ids, chunked_attention_mask, past_key_values=past_key_values)
+            # print(f'{input_ids.shape=}, {attention_mask.shape=}, {past_key_values[0].shape=}')
+            # the compressed kv cache should all be attened, so the attention_mask should be None
+            return self.model(input_ids, None, past_key_values=past_key_values)
         
-        
+    def set_cache(self, use_cache):
+        return self.model.set_cache(use_cache)
+    
+    def clean_cache(self):
+        return self.model.clean_cache()
+
