@@ -16,7 +16,6 @@ config = CollieConfig.from_pretrained("huggyllama/llama-7b",
 # config.pp_size = 1
 config.num_hidden_layers=2 # reduce model size
 config.checkpointing = False
-model = LlamaForCausalLM(config=config)
 
 batch_size=1
 seq_len=2048
@@ -26,22 +25,27 @@ d_query=config.hidden_size // 4
 d_ffn=config.hidden_size // 2
 num_heads=config.num_key_value_heads
 query_len=chunk_size // 8
-
 num_layers=config.num_hidden_layers
 
-tokens=torch.zeros(batch_size, seq_len).long().cuda()
-attention_mask=torch.zeros(seq_len, seq_len).long().cuda()
+mem_perceiver_config = {
+    "d_model": d_model,
+    "d_query": d_query,
+    "d_ffn": d_ffn,
+    "chunk_size": chunk_size,
+    "query_len": query_len,
+    "num_heads": num_heads,
+    "num_layers": num_layers
+}
+setattr(config, 'mem_perceiver_config', mem_perceiver_config) 
 
-mem_perceiver = MemPerceiver(
+model = LlamaForCausalLM(config=config)
+
+tokens=torch.zeros(batch_size, seq_len).long().cuda()
+attention_mask=torch.zeros(batch_size, seq_len).long().cuda()
+
+mem_perceiver = MemPerceiver.from_config(
     config=config,
-    model=model, 
-    num_layers=num_layers, 
-    query_len=query_len, 
-    d_query=d_query, 
-    d_model=d_model, 
-    d_ffn=d_ffn, 
-    num_heads=num_heads, 
-    chunk_size=chunk_size)
+    model=model)
 mem_perceiver = mem_perceiver.cuda()
 mem_perceiver.train()
 
