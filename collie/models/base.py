@@ -122,7 +122,7 @@ class CollieModelForCausalLM(nn.Module, GenerationMixin):
                 ))
             with ContextManagers(contexts):
                 model = super().__new__(model_cls)
-                model.__init__(config)
+                model.__init__(config, **kwargs)
         else:
             logger.info("Pipeline initialization starts, the provided loss_fn is not currently being used; it will be utilized in trainer.")
             model = PipelineModel(
