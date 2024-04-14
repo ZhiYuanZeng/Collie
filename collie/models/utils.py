@@ -99,8 +99,8 @@ def inputs_to_kv_cache_for_layer(idx, inputs):
     在第idx层的输入阶段，将inputs字典中的kv_cahce转化为元组形式的layer_past
     """
     if f"past_key_values_layer{idx}_key" in inputs and f"past_key_values_layer{idx}_value" in inputs:
-        return (inputs[f"past_key_values_layer{idx}_key"], 
-                inputs[f"past_key_values_layer{idx}_value"]) 
+        return torch.stack([inputs[f"past_key_values_layer{idx}_key"], 
+                inputs[f"past_key_values_layer{idx}_value"]], dim=0) 
     else:
         return None
 

@@ -46,7 +46,7 @@ from typing import Any
 # support inference with long generation (compress on-the-fly)
 
 class PerceiverLayer(nn.Module):
-    def __init__(self, d_query, d_model, num_heads, d_ffn) -> None:
+    def __init__(self, d_query, d_model, num_heads, d_ffn, collie_config=None) -> None:
         super().__init__()
         self.d_model = d_model
         # TODO: MultiheadAttention的output projection只有一个，但是输出的kv cache和perceiver的dimension不一样，kv cache: d_model, perceiver: d_query，也就是需要两个projection
@@ -64,8 +64,9 @@ class PerceiverLayer(nn.Module):
             nn.ReLU(),
             nn.Linear(d_ffn, d_query),
         )
+        self.collie_config = collie_config
 
-    def _forward(self, query, kv_cache, key_forward=True):
+    def __forward(self, query, kv_cache, key_forward=True):
         if key_forward:
             cross_attention_func = self.k_cross_attention
             attn_layer_norm = self.k_attn_layer_norm
@@ -96,11 +97,26 @@ class PerceiverLayer(nn.Module):
         query = ffn_outputs + res
         return query
 
-    def forward(self, compressed_k, compressed_v, keys, values):
+    def _forward(self, compressed_k, compressed_v, keys, values):
         # compress keys to compressed_k, compress values to compressed_v
-        compressed_k = self._forward(compressed_k, keys, key_forward=True)
-        compressed_v = self._forward(compressed_v, values, key_forward=False)
+        compressed_k = self.__forward(compressed_k, keys, key_forward=True)
+        compressed_v = self.__forward(compressed_v, values, key_forward=False)
         return compressed_k, compressed_v
+
+    def forward(self, compressed_k, compressed_v, keys, values):
+        if self.collie_config is not None and self.collie_config.checkpointing:
+            return torch.utils.checkpoint.checkpoint(
+                self._forward,
+                compressed_k,
+                compressed_v,
+                keys,
+                values
+            )
+        else:
+            return self._forward(compressed_k, compressed_v, keys, values)
+
+def gradient_hook(grad):
+    print(f"Gradient: {grad}")
 
 class MemPerceiver(CollieModelForCausalLM):
     def __init__(self, config, model: torch.nn.Module, num_layers, query_len, d_query, d_model, d_ffn, num_heads, chunk_size):
@@ -117,7 +133,7 @@ class MemPerceiver(CollieModelForCausalLM):
         self.k_query_embed = nn.Parameter(torch.zeros(query_len, d_query))
         self.v_query_embed = nn.Parameter(torch.zeros(query_len, d_query))
         self.perceiver_layers = nn.ModuleList(
-            [PerceiverLayer(d_query=d_query, d_model=d_model, d_ffn=d_ffn, num_heads=num_heads) for _ in range(num_layers)])
+            [PerceiverLayer(d_query=d_query, d_model=d_model, d_ffn=d_ffn, num_heads=num_heads, collie_config=config) for _ in range(num_layers)])
         self.output_key_projections = nn.ModuleList([nn.Linear(d_query, d_model) for _ in range(num_layers)])
         self.output_value_projections = nn.ModuleList([nn.Linear(d_query, d_model) for _ in range(num_layers)])
 
@@ -125,13 +141,6 @@ class MemPerceiver(CollieModelForCausalLM):
     def from_config(cls, config, model):
         kwargs = config.mem_perceiver_config
         kwargs['model'] = model
-        # num_layers=config.mem_perceiver_config['num_layers'] 
-        # query_len=config.mem_perceiver_config['query_len'] 
-        # d_query=config.mem_perceiver_config['d_query'] 
-        # d_model=config.mem_perceiver_config['d_model'] 
-        # d_ffn=config.mem_perceiver_config['d_ffn'] 
-        # num_heads=config.mem_perceiver_config['num_heads'] 
-        # chunk_size=config.mem_perceiver_config['chunk_size']
         return super().from_config(config, **kwargs)
 
     def compress(self, keys, values):
@@ -146,8 +155,12 @@ class MemPerceiver(CollieModelForCausalLM):
         for i, (layer, k, v) in enumerate(zip(self.perceiver_layers, keys, values)):
             assert isinstance(k, torch.Tensor)
             assert isinstance(v, torch.Tensor)
+            if self.training:
+                assert compressed_k.requires_grad and compressed_v.requires_grad
             # print(f'k shape: {k.shape}, v shape: {v.shape}', flush=True)
+
             compressed_k, compressed_v = layer(compressed_k, compressed_v, k, v)
+            # assert compressed_k.requires_grad and compressed_v.requires_grad
 
             output_compressed_k = self.output_key_projections[i](compressed_k)
             output_compressed_v = self.output_value_projections[i](compressed_v)
@@ -184,7 +197,7 @@ class MemPerceiver(CollieModelForCausalLM):
             
             cached_llm_outpus = []
 
-            print("compress prompt...", flush=True)
+            # print("compress prompt...", flush=True)
             # compress the kv cache of prompt
             assert past_key_values is None
             cached_compressed_kv = None
@@ -194,24 +207,23 @@ class MemPerceiver(CollieModelForCausalLM):
                 #     torch.set_grad_enabled(False)
                 # print(f'input shape: {chunked_input_ids[i].shape}, {chunked_attention_mask[i].shape}, {attention_mask.shape}')
                 model_outputs = self.model(chunked_input_ids[i], chunked_attention_mask[i], past_key_values=cached_compressed_kv)
-
+ 
                 # torch.set_grad_enabled(is_grad_enabled)
 
                 kv_cache = model_outputs.past_key_values # kv_cache is list of tuple: [(key of layer0, value of layer0), ...]
-                keys, values = [kv[0] for kv in kv_cache], [kv[1] for kv in kv_cache]
+                keys, values = [kv[0].detach() for kv in kv_cache], [kv[1].detach() for kv in kv_cache]
                 compressed_keys, compressed_values = self.compress(keys, values)
                 
-                assert compressed_keys[0].requires_grad and compressed_values[0].requires_grad
+                # assert compressed_keys.requires_grad and compressed_values.requires_grad
                 cached_llm_outpus.append(model_outputs)
                 # if i!=0:
                 #     cached_llm_outpus.append(model_outputs) # drop the first rank, since the first chunk does not use compressed memory
+                new_compressed_kv = torch.stack([torch.stack([ck,cv], dim=0) for ck, cv in zip(compressed_keys, compressed_values)], dim=0) # [num_layers, 2, bsz, seq_len, num_heads, head_dim]
                 if cached_compressed_kv is None:
-                    cached_compressed_kv = [torch.stack([ck,cv], dim=0) for ck, cv in zip(compressed_keys, compressed_values)] # ([2, 1, seq_len, num_heads, head_dim], [...], ...)
+                    cached_compressed_kv = new_compressed_kv
+                    # cached_compressed_kv.register_hook(gradient_hook)
                 else:
-                    cached_compressed_kv = [
-                        torch.cat([cached_kv, torch.stack([ck,cv], dim=0)], dim=2)
-                        for cached_kv, ck, cv in zip(cached_compressed_kv, compressed_keys, compressed_values)]
-                
+                    cached_compressed_kv = torch.cat([cached_compressed_kv, new_compressed_kv], dim=3)
             accum_logits = torch.cat([o.logits for o in cached_llm_outpus], dim=1) # batch_size, seq_len
             # TODO: accumulate hidden states
             # print(f"hidden states shape: {cached_llm_outpus[0][0].shape}, {cached_llm_outpus[0][1].shape}, {cached_llm_outpus[0][2].shape}")
@@ -226,13 +238,13 @@ class MemPerceiver(CollieModelForCausalLM):
             return lm_output
         
         else:
-            print("incremental decoding...", flush=True)
+            # print("incremental decoding...", flush=True)
             # incremental decoding
             assert past_key_values is not None
             # print(f'{input_ids.shape=}, {attention_mask.shape=}, {past_key_values[0].shape=}')
             # the compressed kv cache should all be attened, so the attention_mask should be None
             return self.model(input_ids, None, past_key_values=past_key_values)
-        
+    
     def set_cache(self, use_cache):
         return self.model.set_cache(use_cache)
     
