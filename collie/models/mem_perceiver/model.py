@@ -1,47 +1,20 @@
-import gc
-import json
-import math
-import os
-from collections import OrderedDict
 from typing import Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
-import torch.nn.functional as F
 import torch.utils.checkpoint
-from deepspeed.accelerator import get_accelerator
-from deepspeed.pipe import LayerSpec, TiedLayerSpec
-from einops import rearrange
-from megatron.core import parallel_state, tensor_parallel
 from torch import nn
 from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from transformers.modeling_utils import dtype_byte_size
-from collie.config import CollieConfig
-from collie.driver.io import IODriver
-from collie.log.logger import logger
 from collie.models.base import CollieModelForCausalLM
-from collie.models.utils import (
-    flash_attention, 
-    kv_cache_to_inputs_for_layer, inputs_to_kv_cache_for_layer, 
-    kv_cache_to_inputs_for_model, inputs_to_kv_cache_for_model, 
-)
-from collie.module import (
-    ColumnParallelLinearWithoutBias,
-    ColumnParallelLMHead,
-    RowParallelLinearWithoutBias,
-)
-from collie.utils import concat_tensor, dict_as_params, env, progress
+from .utils import Scale, PerceiverAttention, gradient_hook
 
-from collie.models.llama import LlamaForCausalLM, LlamaLayer
 from typing import Any
 
 # TODO:
 # implement from_pretrained, load_state_dict, save_state_dict
 # 支持不定长的inputs (inference)
-# support backward with checkpointing
+# 实现kv cache压缩
 # support recurrent compression
 # support inference with long generation (compress on-the-fly)
 
@@ -115,18 +88,14 @@ class PerceiverLayer(nn.Module):
         else:
             return self._forward(compressed_k, compressed_v, keys, values)
 
-def gradient_hook(grad):
-    print(f"Gradient: {grad}")
-
 class MemPerceiver(CollieModelForCausalLM):
-    def __init__(self, config, model: torch.nn.Module, num_layers, query_len, d_query, d_model, d_ffn, num_heads, chunk_size):
+    def __init__(self, config, num_layers, query_len, d_query, d_model, d_ffn, num_heads, chunk_size, model=None):
         # cross-attention+ffn
         # soft query tokens at each layer
         super().__init__(config)
-
         self.model = model
-        for p in self.model.parameters():
-            p.requires_grad = False
+        if self.model is not None:
+            self.frozen_model()
         self.chunk_size = chunk_size
         self.query_len = query_len
 
@@ -137,11 +106,17 @@ class MemPerceiver(CollieModelForCausalLM):
         self.output_key_projections = nn.ModuleList([nn.Linear(d_query, d_model) for _ in range(num_layers)])
         self.output_value_projections = nn.ModuleList([nn.Linear(d_query, d_model) for _ in range(num_layers)])
 
+    def frozen_model(self):
+        for p in self.model.parameters():
+            p.requires_grad = False
+
     @classmethod
     def from_config(cls, config, model):
         kwargs = config.mem_perceiver_config
-        kwargs['model'] = model
-        return super().from_config(config, **kwargs)
+        mem_perceiver = super().from_config(config, **kwargs) # from config会对模型做随机初始化，所以初始化完后再传入pretrained model
+        mem_perceiver.model = model
+        mem_perceiver.frozen_model()
+        return mem_perceiver
 
     def compress(self, keys, values):
         # output compressed kv_cachee
@@ -251,3 +226,70 @@ class MemPerceiver(CollieModelForCausalLM):
     def clean_cache(self):
         return self.model.clean_cache()
 
+# TODO: 去掉multihead attention中的value projection，控制temperature
+class ParallelPerceiverLayer(nn.Module):
+    # 每一层并行地压缩kv cache，不同层的压缩没有关联
+    # key和value共享attention weights，所以直接把他们拼接在一起作为cross-attention的values
+    def __init__(self, query_len, d_query, d_model, num_heads, temperature=1.0):
+        super().__init__()
+        self.query_embedding = nn.Parameter(torch.randn(query_len, d_query))
+        # PerceiverAttention is different from multiheadattention that it does not need value projection and output projection
+        self.cross_attention = PerceiverAttention(
+            d_query, num_heads, kdim=d_model, vdim=2*d_model, batch_first=True)
+        self.num_heads = num_heads
+        self.key_scale = Scale(d_model) # bsz, seq, d_model
+        self.value_scale = Scale(d_model)
+        self.temperature = temperature
+        self.d_model = d_model
+        self.query_len = query_len
+        assert self.temperature == 0.1
+    
+    def forward(self, keys, values):
+        bsz, seq_len, num_heads, head_dim = keys.shape
+        cross_attention_query = torch.expand_copy(self.query_embedding.unsqueeze(dim=0), [bsz, *self.query_embedding.shape]) / self.temperature
+        
+        cross_attention_key = keys.view(bsz, seq_len, self.d_model)
+        # we want keys and values to share attention weights
+        cross_attention_value = torch.cat(
+            [keys, values], dim=-1) # (bsz seq_len, num_heads, 2*head_dim)
+        cross_attention_value = cross_attention_value.view(bsz, seq_len, 2*self.d_model)
+        attention_outputs = self.cross_attention(cross_attention_query, cross_attention_key, cross_attention_value)
+        attention_outputs = attention_outputs[0].view(bsz, self.query_len, num_heads, 2, head_dim)
+        compressed_keys, compresser_values = attention_outputs[:, :, :, 0, :], attention_outputs[:, :, :, 1, :]
+        compressed_keys = compressed_keys.reshape(bsz, self.query_len, self.d_model)
+        compresser_values = compresser_values.reshape(bsz, self.query_len, self.d_model)
+        
+
+        return self.key_scale(compressed_keys), self.value_scale(compresser_values)
+
+class ParallelMemPerceiver(MemPerceiver):
+    def __init__(self, config, num_layers, query_len, d_query, d_model, num_heads, chunk_size, temperature=1.0, model=None):
+        # cross-attention+ffn
+        # soft query tokens at each layer
+        CollieModelForCausalLM.__init__(self, config)
+
+        self.model = model
+        self.chunk_size = chunk_size
+        self.query_len = query_len
+
+        self.perceiver_layers = nn.ModuleList(
+            [ParallelPerceiverLayer(query_len, d_query, d_model, num_heads, temperature) for _ in range(num_layers)]
+        )
+    
+    def compress(self, keys, values):
+        # output compressed kv_cachee
+        bsz, seq_len, num_heads, head_dim = keys[0].shape
+
+        compressed_k_layers, compressed_v_layers = [], []
+        for i, (layer, k, v) in enumerate(zip(self.perceiver_layers, keys, values)):
+            assert isinstance(k, torch.Tensor)
+            assert isinstance(v, torch.Tensor)
+            # print(f'k shape: {k.shape}, v shape: {v.shape}', flush=True)
+
+            compressed_k, compressed_v = layer(k, v)
+            # assert compressed_k.requires_grad and compressed_v.requires_grad
+            compressed_k_layers.append(compressed_k.reshape(bsz, self.query_len, num_heads, head_dim))
+            compressed_v_layers.append(compressed_v.reshape(bsz, self.query_len, num_heads, head_dim))
+            # print(f'after compression | k shape: {compressed_k_layers[-1].shape}, v shape: {compressed_k_layers[-1].shape}', flush=True)
+
+        return compressed_k_layers, compressed_v_layers
