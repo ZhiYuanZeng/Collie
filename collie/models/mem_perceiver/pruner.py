@@ -136,6 +136,35 @@ class H2oPruner(CollieModelForCausalLM):
     def clean_cache(self):
         return self.model.clean_cache()
 
+    @staticmethod
+    def save_parallel_state_dict(state_dict: dict,
+        path: str,
+        config,
+        process_exclusion: bool = False,
+        protocol: str = "file",
+    ):
+        if env.rank == 0:
+            config.save_pretrained(path, protocol=protocol)
+            new_state_dict = {}
+            for k,v in state_dict.items():
+                if 'model.' not in k:
+                    new_state_dict[k] = v
+            torch.save(new_state_dict, path + '/pytorch_model.bin')
+
+    @staticmethod
+    def load_parallel_state_dict(
+        path: str,
+        config,
+        process_exclusion: bool = False,
+        protocol: str = "file",
+        **kwargs,
+    ):
+        state_dict = torch.load(path + '/pytorch_model.bin', map_location='cpu')
+        return state_dict
+
+    def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False):
+        return super().load_state_dict(state_dict, strict=False, assign=assign)   
+
 class StreamingLMPruner(H2oPruner):
     def get_indices(self, attention, target_len):
         # indices shape: (bsz, num_heads, target_len)
