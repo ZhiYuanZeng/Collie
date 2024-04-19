@@ -107,6 +107,11 @@ class H2oPruner(CollieModelForCausalLM):
                     cached_compressed_kv = torch.stack([torch.stack([ck,cv], dim=0) for ck, cv in zip(compressed_keys, compressed_values)], dim=0) # [num_layers, 2, bsz, seq_len, num_heads, head_dim]
                 else: # local window
                     cached_compressed_kv = None
+                # we need to detach output to free memory
+                model_outputs =CausalLMOutputWithPast(
+                    logits=model_outputs.logits,
+                )
+
                 cached_llm_outpus.append(model_outputs) # drop the first rank, since the first chunk does not use compressed memory
                 
             accum_logits = torch.cat([o.logits for o in cached_llm_outpus], dim=1) # batch_size, seq_len
