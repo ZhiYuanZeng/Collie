@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from typing import Mapping, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
@@ -11,15 +11,17 @@ from .utils import Scale, PerceiverAttention, gradient_hook
 import math
 import random
 from typing import Any
+from collie.utils import env
 
 class H2oPruner(CollieModelForCausalLM):
-    def __init__(self, config, chunk_size, query_len, model=None, **kwargs):
+    def __init__(self, config, chunk_size, query_len, model=None, num_sink_tokens=0, **kwargs):
         super().__init__(config)
         self.model = model
         self.chunk_size = chunk_size
         self.query_len = query_len
         if self.model is not None:
             self.frozen_model()
+        self.num_sink_tokens = num_sink_tokens
         # TODO: accumulate important scores AND normalization scores
         # self.accumulate_scores = None
         # self.accumulate_norm = None
@@ -174,13 +176,31 @@ class StreamingLMPruner(H2oPruner):
     def get_indices(self, attention, target_len):
         # indices shape: (bsz, num_heads, target_len)
         bsz, num_heads = attention.shape[0], attention.shape[1]
-        indices = torch.arange(target_len, device=attention.device)
-        return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
+        indices = torch.arange(self.num_sink_tokens, device=attention.device)
+        return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, self.num_sink_tokens)
+    
+    def compress(self, keys, values, attentions, target_len):
+        keeped_keys = []
+        keeped_values = []
+        bsz, seq_len, num_heads, head_dim = keys[0].shape
+        for key, value, attention in zip(keys, values, attentions):
+            topk_indices = self.get_indices(attention, target_len)
+            topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, self.num_sink_tokens, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
+            topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
+
+            selected_keys = torch.gather(key, index=topk_indices, dim=1)
+            selected_values = torch.gather(value, index=topk_indices, dim=1)
+
+            assert selected_keys.shape == (bsz, self.num_sink_tokens, num_heads, head_dim)
+            keeped_keys.append(selected_keys)
+            keeped_values.append(selected_values)
+        return keeped_keys, keeped_values
 
 class RandomPruner(H2oPruner):
+    # sink tokens + random tokens
     def get_indices(self, attention, target_len):
         bsz, num_heads, seq_len = attention.shape[0], attention.shape[1], attention.shape[-1]
-        indices = list(range(4)) + random.sample(range(seq_len), target_len-4)
+        indices = list(range(self.num_sink_tokens)) + random.sample(range(seq_len), target_len-self.num_sink_tokens)
         indices = torch.tensor(indices, device=attention.device)
         return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
 
@@ -214,11 +234,12 @@ class SparseParallelLayer(nn.Module):
         topk_indices, topk_values = topk_indices.view(bsz, num_heads, target_len), topk_values.view(bsz, num_heads, target_len)
         
         # find the kv with the lowest scores, and replace them with sink tokens
-        sink_token_indices = topk_values.topk(k=self.num_sink_tokens, dim=-1).indices # (bsz, num_heads, num_sink)
-        topk_indices = torch.scatter(topk_indices, index=sink_token_indices, dim=-1, 
-                                    src=torch.arange(self.num_sink_tokens).type_as(topk_indices).view(1,1,self.num_sink_tokens).expand_as(sink_token_indices))
-        topk_values = torch.scatter(topk_values, index=sink_token_indices, dim=-1, 
-                                    src=torch.ones([1,1,self.num_sink_tokens]).type_as(topk_values).expand_as(sink_token_indices))
+        if self.num_sink_tokens > 0:
+            sink_token_indices = topk_values.topk(k=self.num_sink_tokens, dim=-1).indices # (bsz, num_heads, num_sink)
+            topk_indices = torch.scatter(topk_indices, index=sink_token_indices, dim=-1, 
+                                        src=torch.arange(self.num_sink_tokens).type_as(topk_indices).view(1,1,self.num_sink_tokens).expand_as(sink_token_indices))
+            topk_values = torch.scatter(topk_values, index=sink_token_indices, dim=-1, 
+                                        src=torch.ones([1,1,self.num_sink_tokens]).type_as(topk_values).expand_as(sink_token_indices))
         topk_indices, topk_values = topk_indices.unsqueeze(dim=-1), topk_values.unsqueeze(dim=-1)
         assert torch.all(topk_indices < seq_len)
 
