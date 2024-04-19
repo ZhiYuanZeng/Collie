@@ -217,8 +217,8 @@ class SparseParallelPerceiver(H2oPruner):
         keeped_values = []
         assert len(keys) == self.num_layers
         for i, (key, value, attention) in enumerate(zip(keys, values, attentions)):
-            selected_keys, selected_values = self.perceiver_layers[i](key, value, target_len)
-            keeped_keys.append(selected_keys)
-            keeped_values.append(selected_values)
+            selected_keys, selected_values = self.perceiver_layers[i](key[:, -self.chunk_size:], value[:, -self.chunk_size:], self.query_len)
+            keeped_keys.append(torch.cat([key[:, :-self.chunk_size], selected_keys], dim=1))
+            keeped_values.append(torch.cat([value[:, :-self.chunk_size], selected_values], dim=1))
         # print(f'key shape before compression: {keys[0].shape}, after compress: {keeped_keys[0].shape}')
         return keeped_keys, keeped_values
