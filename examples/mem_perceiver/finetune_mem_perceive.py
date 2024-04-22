@@ -84,19 +84,45 @@ setattr(config, 'mem_perceiver_config', mem_perceiver_config)
 tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=True)
 
 # 4. 加载数据集
-max_seq_len = 1024
-eval_set_size = 50
-raw_train_dataset = [
-    {
-        'tokens': torch.tensor(sample['input_ids'])[:max_seq_len],
-        'output': torch.tensor(sample['labels'])[:max_seq_len],
-        'attention_mask': torch.tensor(sample['attention_mask'])[:max_seq_len],
-    } for sample in datasets.load_from_disk("/remote-home/share/personal/zyzeng/data/demo_1k/")
-]
-print('example data: {}'.format(tokenizer.decode(raw_train_dataset[0]['tokens'])))
-train_dataset = CollieDatasetForTraining(raw_train_dataset[:-eval_set_size])
-eval_dataset = train_dataset[-eval_set_size:]
-print(f'training set size: {len(train_dataset)}, eval set size: {len(eval_dataset)}')
+def prepare_train_dataset(samples, max_seq_len):
+    sub_samples = []
+    for sample in samples:
+        sub_samples.append(sample)
+        if len(sub_samples) == num_train_data:
+            break
+    dataset = CollieDatasetForTraining([
+        {
+            'tokens': torch.tensor(sample['input_ids'])[:max_seq_len],
+            'output': torch.tensor(sample['labels'])[:max_seq_len],
+            'attention_mask': torch.tensor(sample['attention_mask'])[:max_seq_len],
+        } for sample in sub_samples
+    ])
+    return dataset
+
+def prepare_eval_dataset(samples, eval_context_len, eval_predict_len):
+    sub_samples = []
+    for sample in samples:
+        sample['labels'] = deepcopy(sample['input_ids'])
+        if eval_context_len > 0:
+            sample['labels'][:eval_context_len] = [-100 for _ in range(eval_context_len)]
+        assert len(sample['labels']) == len(sample['input_ids'])
+        sub_samples.append(sample)
+        if len(sub_samples) == num_eval_data:
+            break
+    dataset = CollieDatasetForTraining([
+        {
+            'tokens': torch.tensor(sample['input_ids'])[:eval_context_len+eval_predict_len],
+            'output': torch.tensor(sample['labels'])[:eval_context_len+eval_predict_len],
+            'attention_mask': torch.ones(len(sample['input_ids'])).long()[:eval_context_len+eval_predict_len],
+        } for sample in sub_samples
+    ])
+    return dataset
+
+train_dataset = prepare_train_dataset(datasets.load_from_disk(train_data_path), max_train_len)
+github_eval_dataset = prepare_eval_dataset(datasets.load_dataset(eval_data_paths[0])['train'], eval_context_len, eval_predict_len)
+arxiv_eval_dataset = prepare_eval_dataset(datasets.load_dataset(eval_data_paths[1])['train'], eval_context_len, eval_predict_len)
+
+print('example data: {}'.format(tokenizer.decode(train_dataset[0]['input_ids'])))
 
 # 5. 加载预训练模型
 model = LlamaForCausalLM.from_pretrained(pretrained_model, config=config)
