@@ -130,13 +130,15 @@ else:
 model_for_training = mem_perceiver
 
 # 6. 设置优化器
-optimizer = torch.optim.Adam(model_for_training.parameters(), lr=2e-5)
-# optimizer = Lomo(
-#     model_for_training,
-#     lr = 0.001,
-#     clip_grad_norm = 5.0
-# )
-
+if args.do_train:
+    perceiver_parameters = []
+    for n,p in model_for_training.named_parameters():
+        if 'model.' not in n:
+            print(n)
+            perceiver_parameters.append(p)
+    optimizer = torch.optim.Adam(perceiver_parameters, lr=2e-5)
+else:
+    optimizer = None
 
 # 7. 添加监视器
 monitors = [
