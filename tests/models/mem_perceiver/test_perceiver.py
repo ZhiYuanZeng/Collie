@@ -4,7 +4,7 @@ sys.path.append("../../../")
 from transformers import AutoTokenizer, GenerationConfig
 
 from collie.models import LlamaForCausalLM
-from collie.models.mem_perceiver import MemPerceiver
+from collie.models.mem_perceiver import MemPerceiver, ParallelMemPerceiver, H2oPruner
 from collie import  CollieConfig, env
 import torch
 from torch.cuda.amp import autocast
@@ -15,7 +15,8 @@ config = CollieConfig.from_pretrained("huggyllama/llama-7b",
 # config.dp_size = 8
 # config.pp_size = 1
 config.num_hidden_layers=2 # reduce model size
-config.checkpointing = False
+config.checkpointing = True
+config.use_flash = False
 
 batch_size=1
 seq_len=2048
@@ -43,14 +44,23 @@ model = LlamaForCausalLM(config=config)
 tokens=torch.zeros(batch_size, seq_len).long().cuda()
 attention_mask=torch.zeros(batch_size, seq_len).long().cuda()
 
-mem_perceiver = MemPerceiver.from_config(
+mem_perceiver = ParallelMemPerceiver.from_config(
     config=config,
     model=model)
 mem_perceiver = mem_perceiver.cuda()
 mem_perceiver.train()
 
+# test training
 with autocast():
     model_outputs = mem_perceiver(tokens, attention_mask)
 logits = model_outputs.logits # (bsz, seq_len, vocab)
 loss = logits.mean()
 loss.backward()
+
+# test decoding
+gen_config = GenerationConfig(max_new_tokens=8, early_stopping=True, eos_token_id=2)
+
+mem_perceiver.eval()
+with autocast():
+    with torch.no_grad():
+        outs = mem_perceiver.generate(tokens, generation_config=gen_config)
