@@ -12,7 +12,7 @@ from collie.controller.trainer import Trainer
 from collie.controller.evaluator import EvaluatorForPerplexity, EvaluatorForGeneration
 
 from collie.models import LlamaForCausalLM
-from collie.models.mem_perceiver import MemPerceiver, ParallelMemPerceiver, H2oPruner, SparseParallelPerceiver, StreamingLMPruner, RandomPruner
+from collie.models.mem_perceiver import MemPerceiver, ParallelMemPerceiver, H2oPruner, SparseParallelPerceiver, StreamingLMPruner, RandomPruner, ChunkPrefix
 
 from collie.utils.monitor import StepTimeMonitor, TGSMonitor, MemoryMonitor, LossMonitor, EvalMonitor
 from collie.metrics import DecodeMetric, PPLMetric
@@ -22,7 +22,8 @@ from datasets import Dataset
 import torch
 import os
 import argparse
-
+from collie.callbacks import CheckpointCallback
+from copy import deepcopy
 
 # 1. 设置路径
 # 1.1 预训练模型路径
@@ -35,13 +36,13 @@ config = CollieConfig.from_pretrained(pretrained_model, trust_remote_code=True)
 config.tp_size = 1
 config.dp_size = 1
 config.pp_size = 1
-config.train_epochs = 100
-config.eval_per_n_steps = 0
-config.eval_per_n_epochs = 1 
+config.train_epochs = 1
+config.eval_per_n_steps = 1000
+config.eval_per_n_epochs = 1
 config.train_micro_batch_size = 4
 config.gradient_accumulation_steps = 1
-config.eval_batch_size = 10
-config.use_flash = False
+config.eval_batch_size = 1
+config.use_flash = True
 config.ds_config = {
         "fp16": {
             "enabled": True
@@ -63,7 +64,8 @@ d_model=config.hidden_size
 d_query=config.hidden_size // 4
 d_ffn=config.hidden_size // 2
 num_heads=config.num_attention_heads
-query_len=chunk_size // 8
+train_query_len=64
+eval_query_len=64
 num_layers=config.num_hidden_layers
 
 mem_perceiver_config = {
@@ -71,7 +73,8 @@ mem_perceiver_config = {
     "d_query": d_query,
     "d_ffn": d_ffn,
     "chunk_size": chunk_size,
-    "query_len": query_len,
+    "query_len": train_query_len,
+    "eval_query_len": eval_query_len,
     "num_heads": num_heads,
     "num_layers": num_layers,
     "num_sink_tokens": 16,
@@ -84,6 +87,16 @@ setattr(config, 'mem_perceiver_config', mem_perceiver_config)
 tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=True)
 
 # 4. 加载数据集
+max_train_len = 8192
+num_train_data = 15000 # 60M
+num_eval_data = 128
+eval_context_len = 0
+# eval_predict_len = 4096
+eval_predict_len = 32768
+train_data_path = "/remote-home/share/personal/zyzeng/data/redpajama-15k-4k-llama/"
+# train_data_path = "/remote-home/share/personal/zyzeng/data/demo_1k/"
+eval_data_paths = ["awettig/github-sample-65536tokens-llama", "awettig/arxiv-sample-65536tokens-llama"]
+
 def prepare_train_dataset(samples, max_seq_len):
     sub_samples = []
     for sample in samples:
@@ -123,12 +136,13 @@ github_eval_dataset = prepare_eval_dataset(datasets.load_dataset(eval_data_paths
 arxiv_eval_dataset = prepare_eval_dataset(datasets.load_dataset(eval_data_paths[1])['train'], eval_context_len, eval_predict_len)
 
 print('example data: {}'.format(tokenizer.decode(train_dataset[0]['input_ids'])))
+print(f'training set size: {len(train_dataset)}, github eval set size: {len(github_eval_dataset)}, arxiv eval set size: {len(arxiv_eval_dataset)}')
 
 # 5. 加载预训练模型
 model = LlamaForCausalLM.from_pretrained(pretrained_model, config=config)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--compress_type", type=str, choices=['parallel_fuse', 'pipeline_fuse', 'h2o', 'parallel_sparse', 'local_window', 'no_compress', 'streaming', 'random_prune'])
+parser.add_argument("--compress_type", type=str, choices=['parallel_fuse', 'pipeline_fuse', 'h2o', 'parallel_sparse', 'local_window', 'no_compress', 'streaming', 'random_prune', 'chunk_prefix'])
 parser.add_argument("--do_train", action='store_true')
 parser.add_argument("--do_eval", action='store_true')
 args = parser.parse_args()
@@ -142,6 +156,8 @@ elif compress_type == 'h2o':
     mem_perceiver = H2oPruner.from_config(config, model)
 elif compress_type == 'streaming':
     mem_perceiver = StreamingLMPruner.from_config(config, model)
+elif compress_type == 'chunk_prefix':
+    mem_perceiver = ChunkPrefix.from_config(config, model)
 elif compress_type == 'random_prune':
     mem_perceiver = RandomPruner.from_config(config, model) # no compress
 elif compress_type == 'parallel_sparse':
@@ -176,30 +192,35 @@ monitors = [
 ]
 
 # 8. 添加Evaluator
-evaluator_ppl = EvaluatorForPerplexity(
+github_evaluator_ppl = EvaluatorForPerplexity(
     model = model_for_training,
     config = config,
-    dataset = eval_dataset,
+    dataset = github_eval_dataset,
     monitors = [
         EvalMonitor(config)
     ],
     metrics = {
-        'ppl': PPLMetric()
+        'github_ppl': PPLMetric()
     }
 )
-evaluator_decode = EvaluatorForGeneration(
+arxiv_evaluator_ppl = EvaluatorForPerplexity(
     model = model_for_training,
     config = config,
-    tokenizer = tokenizer,
-    dataset = eval_dataset,
+    dataset = arxiv_eval_dataset,
     monitors = [
         EvalMonitor(config)
     ],
     metrics = {
-        'decode': DecodeMetric()
+        'arxiv_ppl': PPLMetric()
     }
+)
 
-)
+callbacks = [
+    CheckpointCallback(f"/remote-home/zyzeng/collie/ckpts/{args.compress_type}",
+        every_n_epochs=1, # 每5个 epoch 保存一次
+        model_only=True, # 仅保存模型权重，不保存optimzer、训练步数等断点重训信息
+    )
+]
 
 # 9. 实例化trainer
 trainer = Trainer(
@@ -209,8 +230,11 @@ trainer = Trainer(
     optimizer = optimizer,
     train_dataset = train_dataset,
     monitors = monitors,
-    evaluators = [evaluator_ppl]
-)
+    evaluators = [github_evaluator_ppl, arxiv_evaluator_ppl],
+    callbacks=callbacks
+) 
+
+trainer.load_model("/remote-home/zyzeng/collie/ckpts/parallel_sparse/epoch_1/")
 
 if args.do_train:
     # 10. 训练/验证
