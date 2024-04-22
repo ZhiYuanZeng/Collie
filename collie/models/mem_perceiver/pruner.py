@@ -226,9 +226,11 @@ class ChunkPrefix(H2oPruner):
         return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
 
 class SparseParallelLayer(nn.Module):
-    def __init__(self, query_len, d_query, d_model, num_sink_tokens) -> None:
+    def __init__(self, query_len, eval_query_len, d_query, d_model, num_sink_tokens) -> None:
         super().__init__()
         self.query_len = query_len
+        self.eval_query_len = eval_query_len
+        assert self.query_len >= self.eval_query_len
         self.query = nn.Parameter(torch.randn(query_len, d_query))
         self.Wq = nn.Linear(d_query, d_query, bias=False)
         self.Wk = nn.Linear(d_model, d_query, bias=False)
@@ -238,18 +240,19 @@ class SparseParallelLayer(nn.Module):
     def forward(self, key, value, target_len):
         # key: (bsz, seq, num_heads, head_dim)
         bsz, seq_len, num_heads, head_dim = key.shape
-        query = self.query.unsqueeze(dim=0).expand(bsz, self.query_len, -1)
+        query_len = self.query_len if self.training else self.eval_query_len
+        query = self.query[:query_len].unsqueeze(dim=0).expand(bsz, query_len, -1)
         projected_query = self.Wq(query) # (bsz, query_len, d_query)
         projected_key = self.Wk(key.view(bsz, seq_len, -1)) # (bsz, seq_len, d_query)
         
-        q_heads = projected_query.reshape(bsz, self.query_len, num_heads, -1)
+        q_heads = projected_query.reshape(bsz, query_len, num_heads, -1)
         k_heads = projected_key.reshape(bsz, seq_len, num_heads, -1)
         
         logits = torch.einsum('bqhd,bkhd->bhqk', q_heads, k_heads)
         
         attention_scores = torch.softmax(logits/math.sqrt(self.d_query), dim=-1)
-        assert target_len % self.query_len == 0
-        num_kv_per_query = target_len // self.query_len
+        assert target_len % query_len == 0
+        num_kv_per_query = target_len // query_len
         topk_values, topk_indices = torch.topk(attention_scores, dim=-1, k=num_kv_per_query) # (bsz, num_heads, query_len, seq_len) -> (bsz, num_heads, query_len, k)
         
         topk_indices, topk_values = topk_indices.view(bsz, num_heads, target_len), topk_values.view(bsz, num_heads, target_len)
@@ -280,10 +283,10 @@ class SparseParallelLayer(nn.Module):
         return selected_keys, selected_values
 
 class SparseParallelPerceiver(H2oPruner):
-    def __init__(self, config, chunk_size, query_len, d_query, d_model, num_layers, num_sink_tokens, model=None, **kwargs):
+    def __init__(self, config, chunk_size, query_len, eval_query_len, d_query, d_model, num_layers, num_sink_tokens, model=None, **kwargs):
         super().__init__(config, chunk_size, query_len, model, **kwargs)
         self.perceiver_layers = nn.ModuleList([
-            SparseParallelLayer(query_len, d_query, d_model, num_sink_tokens)
+            SparseParallelLayer(query_len, eval_query_len, d_query, d_model, num_sink_tokens)
             for i in range(num_layers)
         ])
         self.num_layers = num_layers
