@@ -32,14 +32,14 @@ class H2oPruner(CollieModelForCausalLM):
 
     @classmethod
     def from_config(cls, config, model):
-        assert not config.use_flash
+        # assert not config.use_flash
         kwargs = config.mem_perceiver_config
         mem_perceiver = super().from_config(config, **kwargs) # from config会对模型做随机初始化，所以初始化完后再传入pretrained model
         mem_perceiver.model = model
         mem_perceiver.frozen_model()
         return mem_perceiver
 
-    def get_indices(self, attention, target_len):
+    def get_indices(self, attention, seq_len,  target_len):
         # attention: [bsz, num_heads, key_len, key_len]
         # key: [bsz, seq_len, num_heads, head_dim]
         important_scores = attention.mean(dim=2) # [bsz, num_heads, seq_len, key_len] -> [bsz, num_heads, key_len]
@@ -53,7 +53,9 @@ class H2oPruner(CollieModelForCausalLM):
         keeped_values = []
         bsz, seq_len, num_heads, head_dim = keys[0].shape
         for key, value, attention in zip(keys, values, attentions):
-            topk_indices = self.get_indices(attention, target_len)
+            if attention is None:
+                attention_shape = (bsz, num_heads, seq_len, seq_len)
+            topk_indices = self.get_indices(attention, attention_shape, target_len).to(key.device)
             topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
             topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
 
@@ -63,6 +65,7 @@ class H2oPruner(CollieModelForCausalLM):
             assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
             keeped_keys.append(selected_keys)
             keeped_values.append(selected_values)
+        # print(f'{keys[0].shape=}, {keeped_keys[0].shape}', flush=True)
         return keeped_keys, keeped_values
 
     def forward(self, input_ids: Any | None = None, attention_mask: Any | None = None, past_key_values: Tuple | None = None, **kwargs):
@@ -173,9 +176,9 @@ class H2oPruner(CollieModelForCausalLM):
         return super().load_state_dict(state_dict, strict=False, assign=assign)   
 
 class StreamingLMPruner(H2oPruner):
-    def get_indices(self, attention, target_len):
+    def get_indices(self, attention, attention_shape, target_len):
         # indices shape: (bsz, num_heads, target_len)
-        bsz, num_heads = attention.shape[0], attention.shape[1]
+        bsz, num_heads = attention_shape[0], attention_shape[1]
         indices = torch.arange(self.num_sink_tokens, device=attention.device)
         return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, self.num_sink_tokens)
     
@@ -184,7 +187,8 @@ class StreamingLMPruner(H2oPruner):
         keeped_values = []
         bsz, seq_len, num_heads, head_dim = keys[0].shape
         for key, value, attention in zip(keys, values, attentions):
-            topk_indices = self.get_indices(attention, target_len)
+            attention_shape = (bsz, num_heads, seq_len, seq_len)
+            topk_indices = self.get_indices(attention_shape, target_len).to(key.device)
             topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, self.num_sink_tokens, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
             topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
 
