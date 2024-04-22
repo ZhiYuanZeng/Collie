@@ -238,7 +238,7 @@ class LlamaLayer(nn.Module):
             query = torch.cat([past_key, query], dim=1)
             key = torch.cat([past_key, key], dim=1)
             value = torch.cat([past_value, value], dim=1)
-        # assert key.requires_grad and value.requires_grad
+
         new_layer_past = None
         if self.use_cache: # TODO: 删除了not self.training的判断，但是有问题，因为这个调整只适合perceiver，而我们改了llama本身的代码
             # 调整成和 hf 兼容的格式，方便 prefix tuning
@@ -257,6 +257,7 @@ class LlamaLayer(nn.Module):
         )
         if self.config.use_flash:
             output = flash_attention(query, key, value, attention_mask)
+            attention_score = None
         else:
             query, key, value = (
                 query.permute(0, 2, 1, 3),
@@ -296,7 +297,7 @@ class LlamaLayer(nn.Module):
             p=self.config.dropout,
             training=self.training,
         )
-        return hidden_states, new_layer_past
+        return hidden_states, new_layer_past, attention_score
 
     def forward(self, inputs: dict):
         layer_past = inputs_to_kv_cache_for_layer(idx=self.idx, inputs=inputs)
@@ -304,18 +305,18 @@ class LlamaLayer(nn.Module):
         if self.config.checkpointing and self.training:
             # if layer_past is not None:
             #     assert layer_past.requires_grad
-            hidden_states, new_layer_past = torch.utils.checkpoint.checkpoint(
+            hidden_states, new_layer_past, attention_score = torch.utils.checkpoint.checkpoint(
                 self._forward,
                 inputs["hidden_states"],
                 inputs.get("attention_mask", None),
                 layer_past,  # inputs.get("past_key_values", None),
             )
         else:
-            hidden_states, new_layer_past = self._forward(inputs["hidden_states"],
+            hidden_states, new_layer_past, attention_score = self._forward(inputs["hidden_states"],
                                                           inputs.get("attention_mask", None), 
                                                           layer_past)  # **inputs
         inputs["hidden_states"] = hidden_states
-
+        inputs[f"attention_score_{self.idx}"] = attention_score
         inputs.update(kv_cache_to_inputs_for_layer(idx=self.idx, new_layer_past=new_layer_past))
         return inputs
 
@@ -359,11 +360,13 @@ class LlamaModel(nn.Module):
         all_hidden_states += (inputs["hidden_states"],)
 
         past_key_values = inputs_to_kv_cache_for_model(self.config.num_hidden_layers, inputs)
+        attention_scores = [inputs[f"attention_score_{i}"] for i,_ in enumerate(self.layers)]
 
         return BaseModelOutputWithPast(
             last_hidden_state=inputs["hidden_states"],
             hidden_states=all_hidden_states,
             past_key_values=past_key_values,
+            attentions=attention_scores
         )
 
     @classmethod
@@ -443,7 +446,7 @@ class LlamaForCausalLM(CollieModelForCausalLM):
             logits=logits,
             past_key_values=output.past_key_values,
             hidden_states=output.hidden_states,
-            attentions=None,
+            attentions=output.attentions,
         )
 
     def clean_cache(self):
