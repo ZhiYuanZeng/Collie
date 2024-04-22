@@ -202,10 +202,21 @@ class StreamingLMPruner(H2oPruner):
 
 class RandomPruner(H2oPruner):
     # sink tokens + random tokens
-    def get_indices(self, attention, target_len):
-        bsz, num_heads, seq_len = attention.shape[0], attention.shape[1], attention.shape[-1]
-        indices = list(range(self.num_sink_tokens)) + random.sample(range(seq_len), target_len-self.num_sink_tokens)
-        indices = torch.tensor(indices, device=attention.device)
+    def get_indices(self, attention, attention_shape, target_len, segment_size=64):
+        bsz, num_heads, seq_len = attention_shape[0], attention_shape[1], attention_shape[-1]
+        assert seq_len % segment_size == 0
+        assert target_len % segment_size == 0
+        target_segment_num = target_len // segment_size
+        segment_num = seq_len // segment_size
+        assert seq_len >= target_len
+        segment_indices = random.sample(range(segment_num), target_segment_num)
+        token_indices = torch.arange(seq_len).view(segment_num, segment_size)[segment_indices]
+        token_indices = token_indices.view(-1)
+        token_indices[:self.num_sink_tokens] = torch.arange(self.num_sink_tokens)
+        print(token_indices, flush=True)
+        # assert len(token_indices) == target_len
+        return token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
+
         return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
 
 class SparseParallelLayer(nn.Module):
