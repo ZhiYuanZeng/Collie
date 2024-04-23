@@ -7,7 +7,8 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from collie.models.base import CollieModelForCausalLM
-from .utils import Scale, PerceiverAttention, gradient_hook
+from collie.models import LlamaForCausalLM
+from collie.config import CollieConfig
 import math
 import random
 from typing import Any
@@ -164,9 +165,6 @@ class H2oPruner(CollieModelForCausalLM):
     @staticmethod
     def load_parallel_state_dict(
         path: str,
-        config,
-        process_exclusion: bool = False,
-        protocol: str = "file",
         **kwargs,
     ):
         state_dict = torch.load(path + '/pytorch_model.bin', map_location='cpu')
@@ -174,6 +172,15 @@ class H2oPruner(CollieModelForCausalLM):
 
     def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False):
         return super().load_state_dict(state_dict, strict=False, assign=assign)   
+
+    @classmethod
+    def from_pretrained(cls, model_path_or_name: str, config: CollieConfig, perceiver_path=None, **kwargs):
+        model = LlamaForCausalLM.from_pretrained(model_path_or_name, config=config)
+        mem_perceiver = cls.from_config(config=config, model=model)
+        if perceiver_path is not None:
+            state_dict = cls.load_parallel_state_dict(perceiver_path)
+            mem_perceiver.load_state_dict(state_dict)
+        return mem_perceiver
 
 class StreamingLMPruner(H2oPruner):
     def get_indices(self, attention, attention_shape, target_len):
