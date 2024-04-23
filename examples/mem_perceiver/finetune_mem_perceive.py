@@ -58,6 +58,10 @@ config.ds_config = {
         # }
 }
 config.checkpointing = True
+pe_config  = {'exp': False, '1d': False, 'imp': False, 'log': False, 
+          'exp_base': 4096, 'log_base': 4096, 'log_clip': 1, 'max_length': 2048, 
+          'pi_lambda': 1, 'base': 10000.0, 'ntk_option': 'dynamic', 'ntk_alpha': 1., }
+setattr(config.model_config, 'pe_config', pe_config)
 
 chunk_size=512
 d_model=config.hidden_size
@@ -93,8 +97,8 @@ num_eval_data = 128
 eval_context_len = 0
 # eval_predict_len = 4096
 eval_predict_len = 32768
-train_data_path = "/remote-home/share/personal/zyzeng/data/redpajama-15k-4k-llama/"
-# train_data_path = "/remote-home/share/personal/zyzeng/data/demo_1k/"
+# train_data_path = "/remote-home/share/personal/zyzeng/data/redpajama-15k-4k-llama/"
+train_data_path = "/remote-home/share/personal/zyzeng/data/demo_1k/"
 eval_data_paths = ["awettig/github-sample-65536tokens-llama", "awettig/arxiv-sample-65536tokens-llama"]
 
 def prepare_train_dataset(samples, max_seq_len):
@@ -131,6 +135,7 @@ def prepare_eval_dataset(samples, eval_context_len, eval_predict_len):
     ])
     return dataset
 
+print('loading training and eval data', flush=True)
 train_dataset = prepare_train_dataset(datasets.load_from_disk(train_data_path), max_train_len)
 github_eval_dataset = prepare_eval_dataset(datasets.load_dataset(eval_data_paths[0])['train'], eval_context_len, eval_predict_len)
 arxiv_eval_dataset = prepare_eval_dataset(datasets.load_dataset(eval_data_paths[1])['train'], eval_context_len, eval_predict_len)
@@ -145,26 +150,27 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--compress_type", type=str, choices=['parallel_fuse', 'pipeline_fuse', 'h2o', 'parallel_sparse', 'local_window', 'no_compress', 'streaming', 'random_prune', 'chunk_prefix'])
 parser.add_argument("--do_train", action='store_true')
 parser.add_argument("--do_eval", action='store_true')
+parser.add_argument("--perceiver_path", type=str, default=None)
 args = parser.parse_args()
  
 compress_type = args.compress_type
 if compress_type == 'parallel_fuse':
-    mem_perceiver = ParallelMemPerceiver.from_config(config, model)
+    mem_perceiver = ParallelMemPerceiver.from_pretrained(pretrained_model, config, args.perceiver_path)
 elif compress_type == 'pipeline_fuse':
-    mem_perceiver = MemPerceiver.from_config(config, model)
+    mem_perceiver = MemPerceiver.from_pretrained(pretrained_model, config, args.perceiver_path)
 elif compress_type == 'h2o':
-    mem_perceiver = H2oPruner.from_config(config, model)
+    mem_perceiver = H2oPruner.from_pretrained(pretrained_model, config, args.perceiver_path)
 elif compress_type == 'streaming':
-    mem_perceiver = StreamingLMPruner.from_config(config, model)
+    mem_perceiver = StreamingLMPruner.from_pretrained(pretrained_model, config, args.perceiver_path)
 elif compress_type == 'chunk_prefix':
-    mem_perceiver = ChunkPrefix.from_config(config, model)
+    mem_perceiver = ChunkPrefix.from_pretrained(pretrained_model, config, args.perceiver_path)
 elif compress_type == 'random_prune':
-    mem_perceiver = RandomPruner.from_config(config, model) # no compress
+    mem_perceiver = RandomPruner.from_pretrained(pretrained_model, config, args.perceiver_path) # no compress
 elif compress_type == 'parallel_sparse':
-    mem_perceiver = SparseParallelPerceiver.from_config(config, model)
+    mem_perceiver = SparseParallelPerceiver.from_pretrained(pretrained_model, config, args.perceiver_path)
 elif compress_type == 'local_window': # remove context
     config.mem_perceiver_config['query_len'] = 0
-    mem_perceiver = H2oPruner.from_config(config, model)
+    mem_perceiver = H2oPruner.from_pretrained(pretrained_model, config, args.perceiver_path)
 elif compress_type == 'no_compress':
     mem_perceiver = model # no compress
 else:
@@ -233,8 +239,6 @@ trainer = Trainer(
     evaluators = [github_evaluator_ppl, arxiv_evaluator_ppl],
     callbacks=callbacks
 ) 
-
-trainer.load_model("/remote-home/zyzeng/collie/ckpts/parallel_sparse/epoch_1/")
 
 if args.do_train:
     # 10. 训练/验证

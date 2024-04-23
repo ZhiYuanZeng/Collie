@@ -34,36 +34,156 @@ from collie.module import (
     RowParallelLinearWithoutBias,
 )
 from collie.utils import concat_tensor, dict_as_params, env, progress
+import numpy as np
+
+# class RotaryPositionEmbedding(nn.Module):
+#     def __init__(self, head_dim: int) -> None:
+#         super().__init__()
+#         inv_freq = 1.0 / (
+#             10000.0
+#             ** (torch.arange(0, head_dim, 2)[: (head_dim // 2)].float() / head_dim)
+#         )
+#         self.register_buffer("inv_freq", inv_freq)
+
+#     def forward(
+#         self, query: torch.Tensor, key: torch.Tensor, seq_len: int, start_pos: int = 0
+#     ):
+#         t = query.dtype
+#         query = torch.view_as_complex(query.float().reshape(*query.shape[:-1], -1, 2))
+#         key = torch.view_as_complex(key.float().reshape(*key.shape[:-1], -1, 2))
+#         freqs = torch.outer(
+#             torch.arange((2**16) * 2, device=self.inv_freq.device), self.inv_freq
+#         ).float()
+#         freqs_cis = torch.polar(torch.ones_like(freqs), freqs)[
+#             start_pos : start_pos + seq_len
+#         ]
+#         shape = [
+#             d if i == 1 or i == query.ndim - 1 else 1 for i, d in enumerate(query.shape)
+#         ]
+#         freqs_cis = freqs_cis.view(*shape)
+#         query = torch.view_as_real(query * freqs_cis).flatten(3)
+#         key = torch.view_as_real(key * freqs_cis).flatten(3)
+#         return query.type(t), key.type(t)
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    # x1 = x[..., :x.shape[-1] // 2]
+    # x2 = x[..., x.shape[-1] // 2:]
+    # return torch.cat((-x2, x1), dim=-1)
+    return torch.stack([-x[..., 1::2], x[..., ::2]], dim=-1).reshape_as(x)
 
 
 class RotaryPositionEmbedding(nn.Module):
-    def __init__(self, head_dim: int) -> None:
+    def __init__(self, head_dim: int, config) -> None:
         super().__init__()
-        inv_freq = 1.0 / (
-            10000.0
-            ** (torch.arange(0, head_dim, 2)[: (head_dim // 2)].float() / head_dim)
-        )
-        self.register_buffer("inv_freq", inv_freq)
+        self.pe_config = config.pe_config
+        self.head_dim = head_dim
+        
+        # batch_size, seq_len, n_head (fixed for tp), head_dim 
+        
+        if self.pe_config['imp']:
+            order, beta = 3,  1 / math.log(10000.0)  # 0.10856
+            start, end = np.power(0.0005, 1 / order), np.power(0.9999, 1 / order)  # 
+            if self.pe_config['1d']:
+                omega = np.power(np.linspace(start, end, head_dim), order)
+            else:
+                omega = np.power(np.linspace(start, end, head_dim // 2), order)
+                omega = np.stack([omega, omega], axis=-1).reshape((head_dim))
+                # omega = np.concatenate([omega, omega], axis=-1)
+            omega = omega[None, None, None, ::-1].copy()
+            expos = (beta / omega) / (1/order * np.power(omega, 1/order - 1))
+        else:
+            alpha = self.pe_config['ntk_alpha'] if self.pe_config['ntk_option'] == 'fixed' else 1
+            if self.pe_config['1d']:
+                base = self.pe_config['base'] * alpha ** (self.head_dim / (self.head_dim - 1))
+                omega = 1.0 / (base ** (np.arange(0, head_dim, 1) / head_dim))
+            else:
+                base = self.pe_config['base'] * alpha ** (self.head_dim / (self.head_dim - 2))
+                omega = 1.0 / (base ** (np.arange(0, head_dim, 2) / head_dim))
+                omega = np.stack([omega, omega], axis=-1).reshape((head_dim))
+                # omega = np.concatenate([omega, omega], axis=-1)
+            omega = omega[None, None, None, :] / self.pe_config['pi_lambda']
+            expos = np.ones_like(omega)
+        self.register_buffer("omega", torch.tensor(omega), persistent=False)
+        self.register_buffer("expos", torch.tensor(np.sqrt(expos)), persistent=False)
 
-    def forward(
-        self, query: torch.Tensor, key: torch.Tensor, seq_len: int, start_pos: int = 0
-    ):
-        t = query.dtype
-        query = torch.view_as_complex(query.float().reshape(*query.shape[:-1], -1, 2))
-        key = torch.view_as_complex(key.float().reshape(*key.shape[:-1], -1, 2))
-        freqs = torch.outer(
-            torch.arange((2**16) * 2, device=self.inv_freq.device), self.inv_freq
-        ).float()
-        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)[
-            start_pos : start_pos + seq_len
-        ]
-        shape = [
-            d if i == 1 or i == query.ndim - 1 else 1 for i, d in enumerate(query.shape)
-        ]
-        freqs_cis = freqs_cis.view(*shape)
-        query = torch.view_as_real(query * freqs_cis).flatten(3)
-        key = torch.view_as_real(key * freqs_cis).flatten(3)
-        return query.type(t), key.type(t)
+        if self.pe_config['exp']:
+            if self.pe_config['imp']:
+                scale = - np.log(omega) / np.log(10000.0) * head_dim
+            else:
+                scale = np.arange(0, head_dim, 1 if self.pe_config['1d'] else 2)
+                scale = scale if self.pe_config['1d'] else np.stack([scale, scale], axis=-1).reshape((head_dim))
+                # scale = scale if self.pe_config['1d'] else np.concatenate([scale, scale], axis=-1)
+                scale = scale[None, None, None, :]
+            scale = (scale + 0.4 * head_dim) / (1.4 * head_dim)
+            self.register_buffer("scale", torch.tensor(scale), persistent=False)
+
+        # inv_freq = 1.0 / (10000.0 ** (
+        #     torch.arange(0, head_dim, 2)[: (head_dim // 2)].float() / head_dim))
+        # self.register_buffer('inv_freq', inv_freq)
+
+    def forward(self,
+                query: torch.Tensor,
+                key: torch.Tensor,
+                seq_len: int,
+                start_pos: int = 0):
+        dtype = query.dtype
+        
+        # batch_size, seq_len, n_head (fixed for tp), head_dim 
+        
+        t = torch.arange(seq_len, device=query.device).reshape(1, -1, 1, 1).float()
+        if self.pe_config['ntk_option'] == 'dynamic': 
+            if self.pe_config['imp']:
+                raise KeyError('ntk for imp is not currently supported')
+            # copy from https://huggingface.co/Qwen/Qwen-7B/blob/main/modeling_qwen.py#L379
+            base = max(2 ** math.ceil(math.log(seq_len / self.pe_config['max_length'], 2) + 1) - 1, 1)
+            alpha = self.pe_config['base'] * base ** (self.head_dim / (self.head_dim - (1 if self.pe_config['1d'] else 2)))
+            theta = 1.0 / (alpha ** (torch.arange(0, self.head_dim, 1 if self.pe_config['1d'] else 2, 
+                                                  device='cuda') / self.head_dim)).float()
+            theta = theta if self.pe_config['1d'] else torch.stack([theta, theta], axis=-1).reshape((self.head_dim))
+            theta = theta[None, None, None, :]
+            self.scale = (torch.clamp(-torch.log(theta)/math.log(10000.0), max=1) + 0.4) / 1.4
+        else:
+            theta = self.omega.float()
+        theta = theta * t
+        sin, cos, expos = torch.sin(theta), torch.cos(theta), self.expos.float()
+
+        q, k = query.float() * expos, key.float() * expos
+
+        if self.pe_config['1d']:
+            q_real = torch.cat([q * cos, q * sin], dim=-1)
+            k_real = torch.cat([k * cos, k * sin], dim=-1)
+            # q_imag = torch.cat([q * sin, -q * cos], dim=-1)
+        else:
+            q_real = q * cos + rotate_half(q) * sin
+            k_real = k * cos + rotate_half(k) * sin
+            # q_imag = q * sin - rotate_half(q) * cos
+            
+        if self.pe_config['exp']:
+            scale = self.scale ** ((t - seq_len // 2) / self.pe_config['exp_base'])
+            scale = scale if not self.pe_config['1d'] else torch.cat([scale, scale], dim=-1)
+            q_real = q_real * scale
+            k_real = k_real / scale
+
+        if self.pe_config['log']:
+            q_real = q_real * torch.clamp(torch.log(t+1) / math.log(self.pe_config['log_base']), min=self.pe_config['log_clip'])
+
+        # query = torch.view_as_complex(
+        #     query.float().reshape(*query.shape[:-1], -1, 2))
+        # key = torch.view_as_complex(
+        #     key.float().reshape(*key.shape[:-1], -1, 2))
+        # freqs = torch.outer(torch.arange(
+        #     (2 ** 16) * 2, device=self.inv_freq.device), self.inv_freq).float()
+        # freqs_cis = torch.polar(torch.ones_like(freqs), freqs)[
+        #     start_pos: start_pos + seq_len]
+        # shape = [d if i == 1 or i == query.ndim -
+        #          1 else 1 for i, d in enumerate(query.shape)]
+        # freqs_cis = freqs_cis.view(*shape)
+        # query = torch.view_as_real(query * freqs_cis).flatten(3)
+        # key = torch.view_as_real(key * freqs_cis).flatten(3)
+        # return query.type(t), key.type(t)
+        
+        return q_real.type(dtype), k_real.type(dtype)
 
 
 class RMSNormalize(nn.Module):
@@ -145,7 +265,8 @@ class LlamaLayer(nn.Module):
                     init_method=lambda x: x,
                 ),
                 "rotary_emb": RotaryPositionEmbedding(
-                    self.config.hidden_size // self.config.num_attention_heads
+                    self.config.hidden_size // self.config.num_attention_heads,
+                    config=config
                 ),
             }
         )
@@ -220,7 +341,6 @@ class LlamaLayer(nn.Module):
                 start_pos = layer_past[0].shape[1]
         else:
             start_pos = 0
-        query, key = self.self_attn["rotary_emb"](query, key, seq_len, start_pos)
         if self.num_key_value_groups > 1:
             key = torch.repeat_interleave(key, dim=2, repeats=self.num_key_value_groups)
             value = torch.repeat_interleave(
@@ -250,6 +370,8 @@ class LlamaLayer(nn.Module):
                 new_layer_past = (present_key, present_value)
             else:
                 new_layer_past = (key, value)
+        query, key = self.self_attn["rotary_emb"](query, key, query.shape[1], start_pos)
+        
         attention_mask = (
             attention_mask
             if attention_mask is not None
