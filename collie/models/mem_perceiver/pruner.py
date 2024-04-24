@@ -267,12 +267,19 @@ class RandomPruner(H2oPruner):
         return token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
 
 class ChunkPrefix(H2oPruner):
-    # keep the first k tokens for each chunk
     def get_indices(self, attention, attention_shape, target_len):
-        # indices shape: (bsz, num_heads, target_len)
         bsz, num_heads = attention_shape[0], attention_shape[1]
         indices = torch.arange(target_len)
         return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
+
+class ChunkPostfix(H2oPruner):
+    # keep the first k tokens for each chunk
+    def get_indices(self, attention, attention_shape, target_len):
+        # indices shape: (bsz, num_heads, target_len)
+        bsz, num_heads, seq_len = attention_shape[0], attention_shape[1], attention_shape[-1]
+        indices = torch.arange(target_len) + (seq_len - target_len)
+        return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
+
 
 class SparseParallelLayer(nn.Module):
     def __init__(self, query_len, eval_query_len, d_query, d_model, num_sink_tokens) -> None:
