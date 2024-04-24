@@ -210,6 +210,20 @@ class H2oPruner(CollieModelForCausalLM):
             mem_perceiver.load_state_dict(state_dict)
         return mem_perceiver
 
+class TovaPruner(H2oPruner):
+    # attention: [bsz, num_heads, key_len, key_len]
+    def get_indices(self, attention, attention_shape, target_len):
+        assert attention is not None
+        new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
+        accum_attention_scores = new_attention_scores.sum(dim = 2) # (bsz, num_heads, seq_len)
+        normalization_scores = torch.ones(attention.shape[-1], device=attention.device) * self.chunk_size
+        normalization_scores[-self.chunk_size:] = self.chunk_size - torch.arange(self.chunk_size, device=attention.device)
+        # print(normalization_scores)
+        assert torch.all(normalization_scores > 0)
+        important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
+        important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
+        return important_indices
+
 class StreamingLMPruner(H2oPruner):
     def get_indices(self, attention, attention_shape, target_len):
         # indices shape: (bsz, num_heads, target_len)
