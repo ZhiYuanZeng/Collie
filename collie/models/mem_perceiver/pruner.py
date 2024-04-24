@@ -14,6 +14,34 @@ import random
 from typing import Any
 from collie.utils import env
 
+class AutoPruner:
+    @staticmethod
+    def from_pretrained(compress_type, pretrained_model_name_or_path, config, perceiver_path):
+        if compress_type == 'h2o':
+            config.use_flash = False
+            pruner = H2oPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+        elif compress_type == 'streaming':
+            pruner = StreamingLMPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+        elif compress_type == 'chunk_prefix':
+            pruner = ChunkPrefix.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+        elif compress_type == 'chunk_postfix':
+            pruner = ChunkPostfix.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+        elif compress_type == 'tova_pruner':
+            config.use_flash = False
+            pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+        elif compress_type == 'random_prune':
+            pruner = RandomPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+        elif compress_type == 'parallel_sparse':
+            pruner = SparseParallelPerceiver.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+        elif compress_type == 'local_window': # remove context
+            config.mem_perceiver_config['query_len'] = 0
+            pruner = H2oPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+        elif compress_type == 'no_compress':
+            pruner = pretrained_model_name_or_path # no compress
+        else:
+            raise NotImplementedError
+        return pruner
+
 class H2oPruner(CollieModelForCausalLM):
     def __init__(self, config, chunk_size, query_len, model=None, num_sink_tokens=0, **kwargs):
         super().__init__(config)
