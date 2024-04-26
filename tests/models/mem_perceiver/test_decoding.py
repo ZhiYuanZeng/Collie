@@ -28,7 +28,6 @@ llm_name_or_path = "/remote-home/share/personal/zyzeng/models/models--TinyLlama-
 # config
 config = CollieConfig.from_pretrained(llm_name_or_path,
         trust_remote_code=True)
-config.num_hidden_layers=2 # reduce model size
 config.checkpointing = True
 config.use_flash = False
 
@@ -40,15 +39,15 @@ d_query=config.hidden_size // 4
 d_ffn=config.hidden_size // 2
 num_heads=config.num_key_value_heads
 query_len=chunk_size // 8
-num_layers=config.num_hidden_layers
+num_layers=config.model_config.num_hidden_layers
 
 mem_perceiver_config = {
     # llm config
     "d_model": d_model,
-    "query_len": query_len,
     "num_heads": num_heads,
     "num_layers": num_layers,
     # custom config
+    "query_len": query_len,
     "d_query": d_query,
     "chunk_size": chunk_size,
     "num_sink_tokens": 4,
