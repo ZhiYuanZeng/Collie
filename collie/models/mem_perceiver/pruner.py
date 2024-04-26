@@ -13,6 +13,8 @@ import math
 import random
 from typing import Any
 from collie.utils import env
+from .utils import gradient_hook
+from functools import partial
 
 class AutoPruner:
     @staticmethod
@@ -31,13 +33,14 @@ class AutoPruner:
             pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         elif compress_type == 'random_prune':
             pruner = RandomPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif compress_type == 'parallel_sparse':
-            pruner = SparseParallelPerceiver.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         elif compress_type == 'local_window': # remove context
             config.mem_perceiver_config['query_len'] = 0
             pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         elif compress_type == 'no_compress':
-            pruner = pretrained_model_name_or_path # no compress
+            pruner = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path, config) # no compress
+        # parameter
+        elif compress_type == 'parallel_sparse':
+            pruner = SparseParallelPerceiver.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         else:
             raise NotImplementedError
         return pruner
@@ -118,7 +121,6 @@ class TovaPruner(CollieModelForCausalLM):
             do compress
         """
         seq_len = input_ids.shape[1]
-        
         if seq_len > self.chunk_size:
             chunked_input_ids = torch.split(input_ids, self.chunk_size, dim=1) # TODO: 支持长度无法被均分的情况
             chunked_attention_mask = torch.split(attention_mask, self.chunk_size, dim=1)
@@ -138,11 +140,14 @@ class TovaPruner(CollieModelForCausalLM):
 
                 keys, values = [kv[0].detach() for kv in kv_cache], [kv[1].detach() for kv in kv_cache]
                 if self.query_len > 0:
-                    compressed_keys, compressed_values = self.compress(keys, values, attention_scores, target_len=(i+1)*self.query_len)
-                
+                    # print(chunked_input_ids[i].shape, flush=True)
+                    if chunked_input_ids[i].shape[1] > self.query_len:
+                        compressed_keys, compressed_values = self.compress(keys, values, attention_scores, target_len=(i+1)*self.query_len)
+                    else:
+                        compressed_keys, compressed_values = keys, values # we do not need to compress it, since it is already very small
                     # assert compressed_keys.requires_grad and compressed_values.requires_grad
                     cached_compressed_kv = torch.stack([torch.stack([ck,cv], dim=0) for ck, cv in zip(compressed_keys, compressed_values)], dim=0) # [num_layers, 2, bsz, seq_len, num_heads, head_dim]
-                else: # local window
+                else: # local windows
                     cached_compressed_kv = None
                 # we need to detach output to free memory
                 model_outputs =CausalLMOutputWithPast(
