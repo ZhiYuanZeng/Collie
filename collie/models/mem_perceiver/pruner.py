@@ -35,15 +35,15 @@ class AutoPruner:
             pruner = SparseParallelPerceiver.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         elif compress_type == 'local_window': # remove context
             config.mem_perceiver_config['query_len'] = 0
-            pruner = H2oPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+            pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         elif compress_type == 'no_compress':
             pruner = pretrained_model_name_or_path # no compress
         else:
             raise NotImplementedError
         return pruner
 
-class H2oPruner(CollieModelForCausalLM):
-    def __init__(self, config, chunk_size, query_len, model=None, num_sink_tokens=0, **kwargs):
+class TovaPruner(CollieModelForCausalLM):
+    def __init__(self, config, chunk_size, query_len, model=None, num_sink_tokens=0, num_layers=0, **kwargs):
         super().__init__(config)
         self.model = model
         self.chunk_size = chunk_size
@@ -51,9 +51,6 @@ class H2oPruner(CollieModelForCausalLM):
         if self.model is not None:
             self.frozen_model()
         self.num_sink_tokens = num_sink_tokens
-        # TODO: accumulate important scores AND normalization scores
-        # self.accumulate_scores = None
-        # self.accumulate_norm = None
     
     def frozen_model(self):
         for p in self.model.parameters():
@@ -68,14 +65,18 @@ class H2oPruner(CollieModelForCausalLM):
         mem_perceiver.frozen_model()
         return mem_perceiver
 
-    def get_indices(self, attention, seq_len,  target_len):
-        # attention: [bsz, num_heads, key_len, key_len]
-        # key: [bsz, seq_len, num_heads, head_dim]
-        important_scores = attention.mean(dim=2) # [bsz, num_heads, seq_len, key_len] -> [bsz, num_heads, key_len]
-        normalized_scores = important_scores / (important_scores.shape[-1] - torch.arange(important_scores.shape[-1]).type_as(important_scores))
-        topk_indices = torch.topk(normalized_scores, k=target_len, largest=True, dim=-1).indices
-        # topk_indices: (bsz, num_heads, k)
-        return topk_indices
+    def get_indices(self, attention, attention_shape, target_len):
+        assert attention is not None
+        new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
+        accum_attention_scores = new_attention_scores.sum(dim = 2) # (bsz, num_heads, seq_len)
+        normalization_scores = torch.ones(attention.shape[-1], device=attention.device) * self.chunk_size
+        normalization_scores[-self.chunk_size:] = self.chunk_size - torch.arange(self.chunk_size, device=attention.device)
+        # print(normalization_scores)
+        assert torch.all(normalization_scores > 0)
+        important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
+        important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
+        important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
+        return important_indices
 
     def compress(self, keys, values, attentions, target_len):
         keeped_keys = []
@@ -84,6 +85,8 @@ class H2oPruner(CollieModelForCausalLM):
         for key, value, attention in zip(keys, values, attentions):
             if attention is None:
                 attention_shape = (bsz, num_heads, seq_len, seq_len)
+            else:
+                attention_shape = attention.shape
             topk_indices = self.get_indices(attention, attention_shape, target_len).to(key.device)
             topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
             topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
@@ -159,6 +162,7 @@ class H2oPruner(CollieModelForCausalLM):
                 hidden_states=None,
                 attentions=None,
             )
+            self.clear_perceiver_cache()
             return lm_output
         
         else:
@@ -174,6 +178,9 @@ class H2oPruner(CollieModelForCausalLM):
     
     def clean_cache(self):
         return self.model.clean_cache()
+
+    def clear_perceiver_cache(self):
+        pass
 
     @staticmethod
     def save_parallel_state_dict(state_dict: dict,
@@ -210,21 +217,56 @@ class H2oPruner(CollieModelForCausalLM):
             mem_perceiver.load_state_dict(state_dict)
         return mem_perceiver
 
-class TovaPruner(H2oPruner):
-    # attention: [bsz, num_heads, key_len, key_len]
-    def get_indices(self, attention, attention_shape, target_len):
+class H2oPruner(TovaPruner):
+    def __init__(self, config, chunk_size, query_len, model=None, num_sink_tokens=0, num_layers=0, **kwargs):
+        super().__init__(config, chunk_size, query_len, model, num_sink_tokens, num_layers, **kwargs)
+        self.accum_attention_scores = [None for i in range(num_layers)]
+        self.num_layers = num_layers
+
+    def get_indices(self, attention, attention_shape,  target_len, layer_idx):
+        # attention: [bsz, num_heads, key_len, key_len]
+        # key: [bsz, seq_len, num_heads, head_dim]
         assert attention is not None
         new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
         accum_attention_scores = new_attention_scores.sum(dim = 2) # (bsz, num_heads, seq_len)
-        normalization_scores = torch.ones(attention.shape[-1], device=attention.device) * self.chunk_size
-        normalization_scores[-self.chunk_size:] = self.chunk_size - torch.arange(self.chunk_size, device=attention.device)
+
+        cached_accum_scores = self.accum_attention_scores[layer_idx]
+        if cached_accum_scores is not None:
+            assert accum_attention_scores.shape[-1] == cached_accum_scores.shape[-1] + self.chunk_size, f'{attention.shape}, {accum_attention_scores.shape[-1]=}, {cached_accum_scores.shape[-1]=} {self.chunk_size=}'
+            accum_attention_scores[:, :, :-self.chunk_size] += cached_accum_scores
+
         # print(normalization_scores)
-        assert torch.all(normalization_scores > 0)
-        important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
-        important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
+        important_indices = torch.topk(accum_attention_scores, dim=-1, k=target_len).indices
+        important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
+        self.accum_attention_scores[layer_idx] = torch.gather(accum_attention_scores, dim=2, index=important_indices)
         return important_indices
 
-class StreamingLMPruner(H2oPruner):
+    def compress(self, keys, values, attentions, target_len):
+        keeped_keys = []
+        keeped_values = []
+        bsz, seq_len, num_heads, head_dim = keys[0].shape
+        for layer_idx, (key, value, attention) in enumerate(zip(keys, values, attentions)):
+            if attention is None:
+                attention_shape = (bsz, num_heads, seq_len, seq_len)
+            else:
+                attention_shape = attention.shape
+            topk_indices = self.get_indices(attention, attention_shape, target_len, layer_idx).to(key.device)
+            topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
+            topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
+
+            selected_keys = torch.gather(key, index=topk_indices, dim=1)
+            selected_values = torch.gather(value, index=topk_indices, dim=1)
+
+            assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
+            keeped_keys.append(selected_keys)
+            keeped_values.append(selected_values)
+        # print(f'{keys[0].shape=}, {keeped_keys[0].shape}', flush=True)
+        return keeped_keys, keeped_values
+    
+    def clear_perceiver_cache(self):
+        self.accum_attention_scores = [None for i in range(self.num_layers)]
+
+class StreamingLMPruner(TovaPruner):
     def get_indices(self, attention, attention_shape, target_len):
         # indices shape: (bsz, num_heads, target_len)
         bsz, num_heads = attention_shape[0], attention_shape[1]
@@ -249,9 +291,9 @@ class StreamingLMPruner(H2oPruner):
             keeped_values.append(selected_values)
         return keeped_keys, keeped_values
 
-class RandomPruner(H2oPruner):
+class RandomPruner(TovaPruner):
     # sink tokens + random tokens
-    def get_indices(self, attention, attention_shape, target_len, segment_size=64):
+    def get_indices(self, attention, attention_shape, target_len, segment_size=1):
         bsz, num_heads, seq_len = attention_shape[0], attention_shape[1], attention_shape[-1]
         assert seq_len % segment_size == 0
         assert target_len % segment_size == 0
@@ -262,17 +304,16 @@ class RandomPruner(H2oPruner):
         token_indices = torch.arange(seq_len).view(segment_num, segment_size)[segment_indices]
         token_indices = token_indices.view(-1)
         token_indices[:self.num_sink_tokens] = torch.arange(self.num_sink_tokens)
-        print(token_indices, flush=True)
         # assert len(token_indices) == target_len
         return token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
 
-class ChunkPrefix(H2oPruner):
+class ChunkPrefix(TovaPruner):
     def get_indices(self, attention, attention_shape, target_len):
         bsz, num_heads = attention_shape[0], attention_shape[1]
         indices = torch.arange(target_len)
         return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
 
-class ChunkPostfix(H2oPruner):
+class ChunkPostfix(TovaPruner):
     # keep the first k tokens for each chunk
     def get_indices(self, attention, attention_shape, target_len):
         # indices shape: (bsz, num_heads, target_len)
@@ -282,7 +323,7 @@ class ChunkPostfix(H2oPruner):
 
 
 class SparseParallelLayer(nn.Module):
-    def __init__(self, query_len, eval_query_len, d_query, d_model, num_sink_tokens) -> None:
+    def __init__(self, query_len, eval_query_len, d_query, d_model, num_sink_tokens=0) -> None:
         super().__init__()
         self.query_len = query_len
         self.eval_query_len = eval_query_len
@@ -293,9 +334,66 @@ class SparseParallelLayer(nn.Module):
         self.d_query = d_query
         self.num_sink_tokens = num_sink_tokens
     
+    def get_random_indices(self, attention, target_len, segment_size=1):
+        bsz, num_heads, seq_len = attention.shape[0], attention.shape[1], attention.shape[-1]
+        assert seq_len % segment_size == 0
+        assert target_len % segment_size == 0
+        target_segment_num = target_len // segment_size
+        segment_num = seq_len // segment_size
+        assert seq_len >= target_len
+        segment_indices = random.sample(range(segment_num), target_segment_num)
+        token_indices = torch.arange(seq_len).view(segment_num, segment_size)[segment_indices]
+        token_indices = token_indices.view(-1)
+        token_indices[:self.num_sink_tokens] = torch.arange(self.num_sink_tokens)
+        # assert len(token_indices) == target_len
+        return token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len), None
+        
+    def get_rank_indices(self, attention, target_len,):
+        important_scores = attention.sum(dim=2) # (bsz, num_heads, seq_len)
+        topk_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
+        return topk_indices, None
+    
+    def get_retrieve_indices(self, attention, target_len):
+        # 为了排除不同query检索的内容重复，需要先对kv做分区，每个query对应单独的区域
+        # attention: (bsz, num_heads, query_len, kv_len)
+        # TODO: handel the case that target_len is not divided by query_len
+        bsz, num_heads, query_len, kv_len = attention.shape
+        if kv_len % query_len != 0:
+            num_pad = query_len - kv_len % query_len
+            # the negative parts are not likely to be selected, just to enable parallel computation
+            attention = torch.nn.functional.pad(attention, pad=[0,num_pad, 0,0, 0,0, 0,0], value=-1)
+            assert attention.shape == (bsz, num_heads, query_len, kv_len+num_pad)
+        else:
+            num_pad = 0
+        assert query_len == self.query_len
+        assert target_len % query_len == 0
+        num_tokens_per_query = (kv_len+num_pad) // query_len
+        attention = attention.reshape(bsz, num_heads, query_len, query_len, num_tokens_per_query)
+        attention = torch.gather(attention, dim=3, 
+                                 index=torch.arange(query_len, device=attention.device).view(1,1,query_len,1,1).expand(bsz, num_heads, query_len, 1, num_tokens_per_query))
+        # attention: (bsz, num_heads, query_len, 1, num_tokens_per_query)
+        attention = attention.squeeze(dim=3)
+        target_len_per_query = target_len // query_len
+        topk_probs, topk_indices = torch.topk(attention, k=target_len_per_query, dim=-1) # (bsz, num_heads, query_len, target_len_per_query)
+        topk_indices += torch.arange(query_len, device=topk_indices.device).view(1,1,query_len,1) * num_tokens_per_query # add offset for each query [0, num_tokens_per_query, 2*num_tokens_per_query, ...]
+        
+        topk_indices = topk_indices.view(bsz, num_heads, target_len)
+        topk_probs = topk_probs.view(bsz, num_heads, target_len)
+        if num_pad > 0:
+            indices = torch.arange(target_len, device=topk_indices.device)
+            non_overflow_mask = (topk_probs[0, 0] >= 0) # mask is shared among batch and head dimension
+            non_overflow_indices = indices[non_overflow_mask]
+
+            topk_indices = topk_indices[:, :, non_overflow_indices]
+            topk_probs = topk_probs[:, :, non_overflow_indices]
+        assert torch.all(topk_probs >= 0) and torch.all(topk_indices < kv_len)
+        return topk_indices, topk_probs
+
     def forward(self, key, value, target_len):
+        ################## estimate attention scores ###################
         # key: (bsz, seq, num_heads, head_dim)
         bsz, seq_len, num_heads, head_dim = key.shape
+            
         query_len = self.query_len if self.training else self.eval_query_len
         query = self.query[:query_len].unsqueeze(dim=0).expand(bsz, query_len, -1)
         projected_query = self.Wq(query) # (bsz, query_len, d_query)
@@ -307,40 +405,48 @@ class SparseParallelLayer(nn.Module):
         logits = torch.einsum('bqhd,bkhd->bhqk', q_heads, k_heads)
         
         attention_scores = torch.softmax(logits/math.sqrt(self.d_query), dim=-1)
-        assert target_len % query_len == 0
-        num_kv_per_query = target_len // query_len
-        topk_values, topk_indices = torch.topk(attention_scores, dim=-1, k=num_kv_per_query) # (bsz, num_heads, query_len, seq_len) -> (bsz, num_heads, query_len, k)
+
+        ################## gather keys and values ###################
+        topk_indices, topk_probs = self.get_retrieve_indices(attention_scores, target_len)
+        topk_indices, sort_indices = torch.sort(topk_indices, dim=-1)
+        topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
+        topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
+        if topk_probs is not None:
+            topk_probs = torch.gather(topk_probs, dim=-1, index=sort_indices)
+            topk_probs = topk_probs.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
+            topk_probs = topk_probs.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
+
+        selected_keys = torch.gather(key, dim=1, index=topk_indices)
+        selected_values = torch.gather(value, dim=1, index=topk_indices)
+        if topk_probs is not None:
+            selected_keys = selected_keys * (1 + topk_probs - topk_probs.detach()) # straight-through trick
+            selected_values = selected_values * (1 + topk_probs - topk_probs.detach())
+
+        # assert target_len % query_len == 0
+        # num_kv_per_query = target_len // query_len
+        # topk_values, topk_indices = torch.topk(attention_scores, dim=-1, k=num_kv_per_query) # (bsz, num_heads, query_len, seq_len) -> (bsz, num_heads, query_len, k)
         
-        topk_indices, topk_values = topk_indices.view(bsz, num_heads, target_len), topk_values.view(bsz, num_heads, target_len)
+        # topk_indices, topk_values = topk_indices.view(bsz, num_heads, target_len), topk_values.view(bsz, num_heads, target_len)
+        # topk_indices, sort_indices = torch.sort(topk_indices, dim=-1)
+        # topk_values = torch.gather(topk_values, dim=-1, index=sort_indices)
+        # topk_indices, topk_values = topk_indices.unsqueeze(dim=-1), topk_values.unsqueeze(dim=-1)
+        # assert torch.all(topk_indices < seq_len)
+
+        # topk_indices = topk_indices.transpose(1, 2).expand(bsz, target_len, num_heads, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, query_len, num_heads, head_dim)
+        # topk_values = topk_values.transpose(1, 2).expand(bsz, target_len, num_heads, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, query_len, num_heads, head_dim)
         
-        # find the kv with the lowest scores, and replace them with sink tokens
-        if self.num_sink_tokens > 0:
-            sink_token_indices = topk_values.topk(k=self.num_sink_tokens, dim=-1).indices # (bsz, num_heads, num_sink)
-            topk_indices = torch.scatter(topk_indices, index=sink_token_indices, dim=-1, 
-                                        src=torch.arange(self.num_sink_tokens).type_as(topk_indices).view(1,1,self.num_sink_tokens).expand_as(sink_token_indices))
-            topk_values = torch.scatter(topk_values, index=sink_token_indices, dim=-1, 
-                                        src=torch.ones([1,1,self.num_sink_tokens]).type_as(topk_values).expand_as(sink_token_indices))
-        topk_indices, topk_values = topk_indices.unsqueeze(dim=-1), topk_values.unsqueeze(dim=-1)
-        assert torch.all(topk_indices < seq_len)
+        # selected_keys = torch.gather(key, index=topk_indices, dim=1)
+        # selected_values = torch.gather(value, index=topk_indices, dim=1)
 
-        # if not self.training:
-        #     print(topk_indices, flush=True)
-
-        topk_indices = topk_indices.transpose(1, 2).expand(bsz, target_len, num_heads, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, query_len, num_heads, head_dim)
-        topk_values = topk_values.transpose(1, 2).expand(bsz, target_len, num_heads, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, query_len, num_heads, head_dim)
-
-        selected_keys = torch.gather(key, index=topk_indices, dim=1)
-        selected_values = torch.gather(value, index=topk_indices, dim=1)
-
-        assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
-        assert selected_keys.shape == topk_values.shape
-        selected_keys = selected_keys * (1 + topk_values - topk_values.detach()) # straight-through trick
-        selected_values = selected_values * (1 + topk_values - topk_values.detach())
+        # assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
+        # assert selected_keys.shape == topk_values.shape
+        # selected_keys = selected_keys * (1 + topk_values - topk_values.detach()) # straight-through trick
+        # selected_values = selected_values * (1 + topk_values - topk_values.detach())
         return selected_keys, selected_values
 
-class SparseParallelPerceiver(H2oPruner):
+class SparseParallelPerceiver(TovaPruner):
     def __init__(self, config, chunk_size, query_len, eval_query_len, d_query, d_model, num_layers, num_sink_tokens, model=None, **kwargs):
-        super().__init__(config, chunk_size, query_len, model, **kwargs)
+        super().__init__(config, chunk_size, query_len, model, num_sink_tokens, **kwargs)
         self.perceiver_layers = nn.ModuleList([
             SparseParallelLayer(query_len, eval_query_len, d_query, d_model, num_sink_tokens)
             for i in range(num_layers)
@@ -352,8 +458,9 @@ class SparseParallelPerceiver(H2oPruner):
         keeped_values = []
         assert len(keys) == self.num_layers
         for i, (key, value, attention) in enumerate(zip(keys, values, attentions)):
-            selected_keys, selected_values = self.perceiver_layers[i](key[:, -self.chunk_size:], value[:, -self.chunk_size:], self.query_len)
-            keeped_keys.append(torch.cat([key[:, :-self.chunk_size], selected_keys], dim=1))
-            keeped_values.append(torch.cat([value[:, :-self.chunk_size], selected_values], dim=1))
+            #  we keep the sink tokens at each chunk
+            selected_keys, selected_values = self.perceiver_layers[i](key[:, self.num_sink_tokens:], value[:, self.num_sink_tokens:], target_len)
+            keeped_keys.append(torch.cat([key[:, :self.num_sink_tokens], selected_keys], dim=1))
+            keeped_values.append(torch.cat([value[:, :self.num_sink_tokens], selected_values], dim=1))
         # print(f'key shape before compression: {keys[0].shape}, after compress: {keeped_keys[0].shape}')
         return keeped_keys, keeped_values
