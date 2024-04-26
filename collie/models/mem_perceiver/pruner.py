@@ -38,7 +38,7 @@ class AutoPruner:
             pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         elif compress_type == 'no_compress':
             pruner = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path, config) # no compress
-        # parameter
+        # parameters required
         elif compress_type == 'parallel_sparse':
             pruner = SparseParallelPerceiver.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         else:
@@ -354,9 +354,9 @@ class SparseParallelLayer(nn.Module):
         return token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len), None
         
     def get_rank_indices(self, attention, target_len,):
-        important_scores = attention.sum(dim=2) # (bsz, num_heads, seq_len)
-        topk_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
-        return topk_indices, None
+        important_scores = attention.mean(dim=2) # (bsz, num_heads, seq_len)
+        topk_values, topk_indices = torch.topk(important_scores, dim=-1, k=target_len)
+        return topk_indices, topk_values
     
     def get_retrieve_indices(self, attention, target_len):
         # 为了排除不同query检索的内容重复，需要先对kv做分区，每个query对应单独的区域
@@ -380,8 +380,7 @@ class SparseParallelLayer(nn.Module):
         attention = attention.squeeze(dim=3)
         target_len_per_query = target_len // query_len
         topk_probs, topk_indices = torch.topk(attention, k=target_len_per_query, dim=-1) # (bsz, num_heads, query_len, target_len_per_query)
-        topk_indices += torch.arange(query_len, device=topk_indices.device).view(1,1,query_len,1) * num_tokens_per_query # add offset for each query [0, num_tokens_per_query, 2*num_tokens_per_query, ...]
-        
+        topk_indices = topk_indices + torch.arange(query_len, device=topk_indices.device).view(1,1,query_len,1) * num_tokens_per_query # add offset for each query [0, num_tokens_per_query, 2*num_tokens_per_query, ...]
         topk_indices = topk_indices.view(bsz, num_heads, target_len)
         topk_probs = topk_probs.view(bsz, num_heads, target_len)
         if num_pad > 0:
@@ -413,6 +412,7 @@ class SparseParallelLayer(nn.Module):
 
         ################## gather keys and values ###################
         topk_indices, topk_probs = self.get_retrieve_indices(attention_scores, target_len)
+        target_len = topk_indices.shape[-1] # the actual target len may be smaller than the expected
         topk_indices, sort_indices = torch.sort(topk_indices, dim=-1)
         topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
         topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
@@ -427,26 +427,6 @@ class SparseParallelLayer(nn.Module):
             selected_keys = selected_keys * (1 + topk_probs - topk_probs.detach()) # straight-through trick
             selected_values = selected_values * (1 + topk_probs - topk_probs.detach())
 
-        # assert target_len % query_len == 0
-        # num_kv_per_query = target_len // query_len
-        # topk_values, topk_indices = torch.topk(attention_scores, dim=-1, k=num_kv_per_query) # (bsz, num_heads, query_len, seq_len) -> (bsz, num_heads, query_len, k)
-        
-        # topk_indices, topk_values = topk_indices.view(bsz, num_heads, target_len), topk_values.view(bsz, num_heads, target_len)
-        # topk_indices, sort_indices = torch.sort(topk_indices, dim=-1)
-        # topk_values = torch.gather(topk_values, dim=-1, index=sort_indices)
-        # topk_indices, topk_values = topk_indices.unsqueeze(dim=-1), topk_values.unsqueeze(dim=-1)
-        # assert torch.all(topk_indices < seq_len)
-
-        # topk_indices = topk_indices.transpose(1, 2).expand(bsz, target_len, num_heads, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, query_len, num_heads, head_dim)
-        # topk_values = topk_values.transpose(1, 2).expand(bsz, target_len, num_heads, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, query_len, num_heads, head_dim)
-        
-        # selected_keys = torch.gather(key, index=topk_indices, dim=1)
-        # selected_values = torch.gather(value, index=topk_indices, dim=1)
-
-        # assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
-        # assert selected_keys.shape == topk_values.shape
-        # selected_keys = selected_keys * (1 + topk_values - topk_values.detach()) # straight-through trick
-        # selected_values = selected_values * (1 + topk_values - topk_values.detach())
         return selected_keys, selected_values
 
 class SparseParallelPerceiver(TovaPruner):
@@ -456,9 +436,11 @@ class SparseParallelPerceiver(TovaPruner):
             SparseParallelLayer(query_len, eval_query_len, d_query, d_model, num_sink_tokens)
             for i in range(num_layers)
         ])
+
         self.num_layers = num_layers
 
     def compress(self, keys, values, attentions, target_len):
+        # print(f'param of W_Q at 1st layer: {self.perceiver_layers[0].Wq.weight.data}')
         keeped_keys = []
         keeped_values = []
         assert len(keys) == self.num_layers
