@@ -125,13 +125,15 @@ class RotaryPositionEmbedding(nn.Module):
     def forward(self,
                 query: torch.Tensor,
                 key: torch.Tensor,
-                seq_len: int,
+                seq_len,
+                positions: torch.Tensor = None,
                 start_pos: int = 0):
         dtype = query.dtype
         
-        # batch_size, seq_len, n_head (fixed for tp), head_dim 
-        
-        t = torch.arange(seq_len, device=query.device).reshape(1, -1, 1, 1).float()
+        # batch_size, seq_len, n_head (fixed for tp), head_dim
+        if positions is None:
+            positions = torch.arange(seq_len, device=query.device)
+        t = positions.reshape(1, -1, 1, 1).float()
         if self.pe_config['ntk_option'] == 'dynamic': 
             if self.pe_config['imp']:
                 raise KeyError('ntk for imp is not currently supported')
@@ -370,7 +372,14 @@ class LlamaLayer(nn.Module):
                 new_layer_past = (present_key, present_value)
             else:
                 new_layer_past = (key, value)
-        query, key = self.self_attn["rotary_emb"](query, key, query.shape[1], start_pos)
+        positions = torch.arange(query.shape[1], device=query.device)
+        # if layer_past is not None:
+        #     previous_key_len = past_key.shape[1]
+        #     positions = positions - previous_key_len + 1 # 0, 1 , 2, 3 (previous_key_len=2) => -1, 0, 1, 2
+        #     positions[:previous_key_len] = 0
+        #     assert torch.all(positions >= 0)
+        seq_len_for_rope = positions[-1].item()
+        query, key = self.self_attn["rotary_emb"](query, key, seq_len_for_rope, positions, start_pos)
         
         attention_mask = (
             attention_mask
