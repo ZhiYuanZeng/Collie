@@ -422,7 +422,10 @@ class SparseParallelLayer(nn.Module):
     def __init__(self, query_len, eval_query_len, d_query, d_model) -> None:
         super().__init__()
         self.query_len = query_len
-        self.eval_query_len = eval_query_len
+        if eval_query_len  == 0:
+            self.eval_query_len = query_len
+        else:
+            self.eval_query_len = eval_query_len
         assert self.query_len >= self.eval_query_len
         self.query = nn.Parameter(torch.randn(query_len, d_query))
         self.Wq = nn.Linear(d_query, d_query, bias=False)
@@ -522,7 +525,7 @@ class SparseParallelLayer(nn.Module):
         return selected_keys, selected_values
 
 class SparseParallelPerceiver(TovaPruner):
-    def __init__(self, config, chunk_size, query_len, eval_query_len, d_query, d_model, num_layers, model=None, **kwargs):
+    def __init__(self, config, chunk_size, query_len, d_query, d_model, num_layers, eval_query_len=0, model=None, **kwargs):
         super().__init__(config, chunk_size, query_len, model, num_layers=num_layers, **kwargs)
         self.perceiver_layers = nn.ModuleList([
             self.build_perceiver_layer(query_len, eval_query_len, d_query, d_model)
