@@ -18,42 +18,54 @@ from functools import partial
 
 class AutoPruner:
     @staticmethod
-    def from_pretrained(compress_type, pretrained_model_name_or_path, config, perceiver_path):
-        if compress_type == 'h2o':
+    def from_pretrained(pruner_type, pretrained_model_name_or_path, config, perceiver_path):
+        if pruner_type == 'h2o':
             config.use_flash = False
+            print('Warning: the h2o pruner requires attention scores, therefore the flash_attention is set to False!')
             pruner = H2oPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif compress_type == 'streaming':
+        elif pruner_type == 'streaming':
             pruner = StreamingLMPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif compress_type == 'chunk_prefix':
+        elif pruner_type == 'chunk_prefix':
             pruner = ChunkPrefix.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif compress_type == 'chunk_postfix':
+        elif pruner_type == 'chunk_postfix':
             pruner = ChunkPostfix.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif compress_type == 'tova_pruner':
+        elif pruner_type == 'tova_pruner':
             config.use_flash = False
+            print('Warning: the h2o pruner requires attention scores, therefore the flash_attention is set to False!')
             pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif compress_type == 'random_prune':
+        elif pruner_type == 'random_prune':
             pruner = RandomPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif compress_type == 'local_window': # remove context
+        elif pruner_type == 'local_window': # remove context
             config.mem_perceiver_config['query_len'] = 0
             pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif compress_type == 'no_compress':
+        elif pruner_type == 'no_compress':
             pruner = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path, config) # no compress
         # parameters required
-        elif compress_type == 'parallel_sparse':
+        elif pruner_type == 'parallel_sparse':
             pruner = SparseParallelPerceiver.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         else:
             raise NotImplementedError
+        if pruner_type == 'h2o':
+            assert config.mem_perceiver_config['memory_type'] in ('write_new_compressed_read_new_compressed', 'update_incremental_compressed_read_all_compressed')
+        if pruner_type == 'tova_pruner':
+            assert config.mem_perceiver_config['memory_type'] in ('write_new_compressed_read_new_compressed', 'increment_compressed_read_all_compressed', 'update_incremental_compressed_read_all_compressed')
+
         return pruner
 
 class TovaPruner(CollieModelForCausalLM):
-    def __init__(self, config, chunk_size, query_len, model=None, num_sink_tokens=0, num_layers=0, **kwargs):
+    def __init__(self, config, chunk_size, query_len, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, **kwargs):
         super().__init__(config)
         self.model = model
         self.chunk_size = chunk_size
         self.query_len = query_len
         if self.model is not None:
             self.frozen_model()
+        assert num_layers > 0
         self.num_sink_tokens = num_sink_tokens
+        self.num_layers = num_layers
+        self.memory_type = memory_type
+        self.cached_keys = [None for _ in range(num_layers)]
+        self.cached_values = [None for _ in range(num_layers)]
     
     def frozen_model(self):
         for p in self.model.parameters():
@@ -70,10 +82,11 @@ class TovaPruner(CollieModelForCausalLM):
 
     def get_indices(self, attention, attention_shape, target_len):
         assert attention is not None
+        chunk_size = min(self.chunk_size, attention.shape[-1])
         new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
         accum_attention_scores = new_attention_scores.sum(dim = 2) # (bsz, num_heads, seq_len)
-        normalization_scores = torch.ones(attention.shape[-1], device=attention.device) * self.chunk_size
-        normalization_scores[-self.chunk_size:] = self.chunk_size - torch.arange(self.chunk_size, device=attention.device)
+        normalization_scores = torch.ones(attention.shape[-1], device=attention.device) * chunk_size
+        normalization_scores[-chunk_size:] = chunk_size - torch.arange(chunk_size, device=attention.device)
         # print(normalization_scores)
         assert torch.all(normalization_scores > 0)
         important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
@@ -81,27 +94,109 @@ class TovaPruner(CollieModelForCausalLM):
         important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
         return important_indices
 
-    def compress(self, keys, values, attentions, target_len):
+    def compress_layer(self, key, value, attention, target_len, layer_idx):
+        bsz, seq_len, num_heads, head_dim = key.shape
+        if attention is None:
+            attention_shape = (bsz, num_heads, seq_len, seq_len)
+        else:
+            attention_shape = attention.shape
+        topk_indices = self.get_indices(attention, attention_shape, target_len).to(key.device)
+        topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
+        topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
+
+        selected_keys = torch.gather(key, index=topk_indices, dim=1)
+        selected_values = torch.gather(value, index=topk_indices, dim=1)
+        assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
+        return selected_keys, selected_values
+    
+    def compress(self, keys, values, attentions, chunk_step):
         keeped_keys = []
         keeped_values = []
-        bsz, seq_len, num_heads, head_dim = keys[0].shape
-        for key, value, attention in zip(keys, values, attentions):
-            if attention is None:
-                attention_shape = (bsz, num_heads, seq_len, seq_len)
-            else:
-                attention_shape = attention.shape
-            topk_indices = self.get_indices(attention, attention_shape, target_len).to(key.device)
-            topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
-            topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
-
-            selected_keys = torch.gather(key, index=topk_indices, dim=1)
-            selected_values = torch.gather(value, index=topk_indices, dim=1)
-
-            assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
+        for i, (key, value, attention) in enumerate(zip(keys, values, attentions)):
+            selected_keys, selected_values = self.read_and_write_memory(
+                self.compress_layer,
+                key=key, value=value, attention=attention, chunk_step=chunk_step, layer_idx=i)
             keeped_keys.append(selected_keys)
             keeped_values.append(selected_values)
-        # print(f'{keys[0].shape=}, {keeped_keys[0].shape}', flush=True)
+        # print(f'before compression, key shape: {keys[0].shape}, value shape: {values[0].shape}, attention shape: {attentions[0].shape}')
+        # print(f'after compression, key shape: {keeped_keys[0].shape}, value shape: {keeped_values[0].shape}')
+
         return keeped_keys, keeped_values
+    
+    def read_and_write_memory(self, compress_func, **kwargs_of_compress_func):
+        chunk_step = kwargs_of_compress_func.pop('chunk_step')
+        layer_idx = kwargs_of_compress_func['layer_idx']
+        # write short-term memory to long-term memory, read from memory
+        key = kwargs_of_compress_func['key']
+        value = kwargs_of_compress_func['value']
+        sink_key = key[:, :self.num_sink_tokens]
+        sink_value = value[:, :self.num_sink_tokens]
+        key = key[:, self.num_sink_tokens:]
+        value = value[:, self.num_sink_tokens:]
+        kwargs_of_compress_func['key'] = key
+        kwargs_of_compress_func['value'] = value
+        if kwargs_of_compress_func['attention'] is not None:
+            kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:,:,:,self.num_sink_tokens:]
+        
+        if self.memory_type == 'write_new_compressed_read_new_compressed':
+            # 类似rmt读写compressed kv cache,但是每次写入会覆盖之前保存的compressed kv cache
+            kwargs_of_compress_func['target_len'] = self.query_len # the compressed memory size is constant
+            compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
+            return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
+        
+        elif self.memory_type == 'increment_compressed_read_all_compressed':
+            # 类似AutoCompresser, 压缩后的kv cache都缓存下来, 并且都被读取
+            incremental_key = key[:, :-self.chunk_size]
+            incremental_value = value[:, :-self.chunk_size]
+            kwargs_of_compress_func['target_len'] = self.query_len # the compressed key size is constant
+            compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
+            return torch.cat([sink_key, incremental_key, compressed_key], dim=1), torch.cat([sink_value, incremental_value, compressed_value], dim=1)
+        
+        elif self.memory_type == 'update_incremental_compressed_read_all_compressed':
+            # memory在随着chunk数量的增加而变长，但是每次增长会刷新整个memory，而incremental memory只会在之前的基础上拼接新的memory
+            kwargs_of_compress_func['target_len'] = self.query_len * (chunk_step + 1) # incremental memory size
+            compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
+            return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
+        
+        elif self.memory_type == 'increment_all_read_retrieved':
+            # 和inf-llm类似，保留所有kv cache,并检索
+            kwargs_of_compress_func['target_len'] = self.query_len
+            cached_key = self.cached_keys[layer_idx]
+            cached_value = self.cached_values[layer_idx]
+            if cached_key is not None:
+                kwargs_of_compress_func['key'] = cached_key
+                kwargs_of_compress_func['value'] = cached_value
+            # retrive
+            compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
+            # cache all kv cache
+            if cached_key is None:
+                self.cached_keys[layer_idx] = key
+                self.cached_values[layer_idx] = value
+            else:
+                self.cached_keys[layer_idx] = torch.cat([cached_key, key], dim=1)
+                self.cached_values[layer_idx] = torch.cat([cached_value, value], dim=1)
+            return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
+
+        elif self.memory_type == 'increment_compressed_read_retrieved':
+            # 保留所有压缩后的kv cache,并检索
+            kwargs_of_compress_func['target_len'] = self.query_len
+            cached_key = self.cached_keys[layer_idx]
+            cached_value = self.cached_values[layer_idx]
+            if cached_key is not None:
+                kwargs_of_compress_func['key'] = cached_key
+                kwargs_of_compress_func['value'] = cached_value
+            compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
+
+            if cached_key is None:
+                self.cached_keys[layer_idx] = compressed_key
+                self.cached_values[layer_idx] = compressed_value
+            else:
+                self.cached_keys[layer_idx] = torch.cat([cached_key, compressed_key], dim=1)
+                self.cached_values[layer_idx] = torch.cat([cached_value, compressed_value], dim=1)
+            return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
+
+        else:
+            raise NotImplementedError
 
     def forward(self, input_ids: Any | None = None, attention_mask: Any | None = None, past_key_values: Tuple | None = None, **kwargs):
         """
@@ -142,7 +237,7 @@ class TovaPruner(CollieModelForCausalLM):
                 if self.query_len > 0:
                     # print(chunked_input_ids[i].shape, flush=True)
                     if chunked_input_ids[i].shape[1] > self.query_len:
-                        compressed_keys, compressed_values = self.compress(keys, values, attention_scores, target_len=(i+1)*self.query_len)
+                        compressed_keys, compressed_values = self.compress(keys=keys, values=values, attentions=attention_scores, chunk_step=i)
                     else:
                         compressed_keys, compressed_values = keys, values # we do not need to compress it, since it is already very small
                     # assert compressed_keys.requires_grad and compressed_values.requires_grad
@@ -185,7 +280,8 @@ class TovaPruner(CollieModelForCausalLM):
         return self.model.clean_cache()
 
     def clear_perceiver_cache(self):
-        pass
+        self.cached_keys = [None for _ in range(self.num_layers)]
+        self.cached_values = [None for _ in range(self.num_layers)]
 
     @staticmethod
     def save_parallel_state_dict(state_dict: dict,
@@ -223,10 +319,9 @@ class TovaPruner(CollieModelForCausalLM):
         return mem_perceiver
 
 class H2oPruner(TovaPruner):
-    def __init__(self, config, chunk_size, query_len, model=None, num_sink_tokens=0, num_layers=0, **kwargs):
-        super().__init__(config, chunk_size, query_len, model, num_sink_tokens, num_layers, **kwargs)
+    def __init__(self, config, num_layers=0, **kwargs):
+        super().__init__(config, num_layers=num_layers, **kwargs)
         self.accum_attention_scores = [None for i in range(num_layers)]
-        self.num_layers = num_layers
 
     def get_indices(self, attention, attention_shape,  target_len, layer_idx):
         # attention: [bsz, num_heads, key_len, key_len]
@@ -246,45 +341,41 @@ class H2oPruner(TovaPruner):
         self.accum_attention_scores[layer_idx] = torch.gather(accum_attention_scores, dim=2, index=important_indices)
         return important_indices
 
-    def compress(self, keys, values, attentions, target_len):
-        keeped_keys = []
-        keeped_values = []
-        bsz, seq_len, num_heads, head_dim = keys[0].shape
-        for layer_idx, (key, value, attention) in enumerate(zip(keys, values, attentions)):
-            if attention is None:
-                attention_shape = (bsz, num_heads, seq_len, seq_len)
-            else:
-                attention_shape = attention.shape
-            topk_indices = self.get_indices(attention, attention_shape, target_len, layer_idx).to(key.device)
-            topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
-            topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
+    def compress_layer(self, key, value, attention, target_len, layer_idx):
+        bsz, seq_len, num_heads, head_dim = key.shape
+        if attention is None:
+            attention_shape = (bsz, num_heads, seq_len, seq_len)
+        else:
+            attention_shape = attention.shape
+        topk_indices = self.get_indices(attention, attention_shape, target_len, layer_idx).to(key.device)
+        topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
+        topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
 
-            selected_keys = torch.gather(key, index=topk_indices, dim=1)
-            selected_values = torch.gather(value, index=topk_indices, dim=1)
+        selected_keys = torch.gather(key, index=topk_indices, dim=1)
+        selected_values = torch.gather(value, index=topk_indices, dim=1)
 
-            assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
-            keeped_keys.append(selected_keys)
-            keeped_values.append(selected_values)
-        # print(f'{keys[0].shape=}, {keeped_keys[0].shape}', flush=True)
-        return keeped_keys, keeped_values
+        assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
+
+        return selected_keys, selected_values
     
     def clear_perceiver_cache(self):
+        super().clear_perceiver_cache()
         self.accum_attention_scores = [None for i in range(self.num_layers)]
 
 class StreamingLMPruner(TovaPruner):
-    def get_indices(self, attention, attention_shape, target_len):
+    def get_indices(self, attention, attention_shape):
         # indices shape: (bsz, num_heads, target_len)
         bsz, num_heads = attention_shape[0], attention_shape[1]
-        indices = torch.arange(self.num_sink_tokens, device=attention.device)
+        indices = torch.arange(self.num_sink_tokens)
         return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, self.num_sink_tokens)
     
-    def compress(self, keys, values, attentions, target_len):
+    def compress(self, keys, values, attentions, **kwargs):
         keeped_keys = []
         keeped_values = []
         bsz, seq_len, num_heads, head_dim = keys[0].shape
         for key, value, attention in zip(keys, values, attentions):
             attention_shape = (bsz, num_heads, seq_len, seq_len)
-            topk_indices = self.get_indices(attention_shape, target_len).to(key.device)
+            topk_indices = self.get_indices(attention, attention_shape).to(key.device)
             topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, self.num_sink_tokens, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
             topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
 
@@ -328,7 +419,7 @@ class ChunkPostfix(TovaPruner):
 
 
 class SparseParallelLayer(nn.Module):
-    def __init__(self, query_len, eval_query_len, d_query, d_model, num_sink_tokens=0) -> None:
+    def __init__(self, query_len, eval_query_len, d_query, d_model) -> None:
         super().__init__()
         self.query_len = query_len
         self.eval_query_len = eval_query_len
@@ -337,7 +428,6 @@ class SparseParallelLayer(nn.Module):
         self.Wq = nn.Linear(d_query, d_query, bias=False)
         self.Wk = nn.Linear(d_model, d_query, bias=False)
         self.d_query = d_query
-        self.num_sink_tokens = num_sink_tokens
     
     def get_random_indices(self, attention, target_len, segment_size=1):
         bsz, num_heads, seq_len = attention.shape[0], attention.shape[1], attention.shape[-1]
@@ -349,7 +439,6 @@ class SparseParallelLayer(nn.Module):
         segment_indices = random.sample(range(segment_num), target_segment_num)
         token_indices = torch.arange(seq_len).view(segment_num, segment_size)[segment_indices]
         token_indices = token_indices.view(-1)
-        token_indices[:self.num_sink_tokens] = torch.arange(self.num_sink_tokens)
         # assert len(token_indices) == target_len
         return token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len), None
         
@@ -385,7 +474,7 @@ class SparseParallelLayer(nn.Module):
         topk_probs = topk_probs.view(bsz, num_heads, target_len)
         if num_pad > 0:
             indices = torch.arange(target_len, device=topk_indices.device)
-            non_overflow_mask = (topk_probs[0, 0] >= 0) # mask is shared among batch and head dimension
+            non_overflow_mask = (topk_probs[0, 0] >= 0) # 只有当pad数量天多，才会选到pad，而且每个样本、每个head都会选到相同数量的pad
             non_overflow_indices = indices[non_overflow_mask]
 
             topk_indices = topk_indices[:, :, non_overflow_indices]
@@ -393,11 +482,8 @@ class SparseParallelLayer(nn.Module):
         assert torch.all(topk_probs >= 0) and torch.all(topk_indices < kv_len)
         return topk_indices, topk_probs
 
-    def forward(self, key, value, target_len):
-        ################## estimate attention scores ###################
-        # key: (bsz, seq, num_heads, head_dim)
+    def get_attention_scores(self, key, value):
         bsz, seq_len, num_heads, head_dim = key.shape
-            
         query_len = self.query_len if self.training else self.eval_query_len
         query = self.query[:query_len].unsqueeze(dim=0).expand(bsz, query_len, -1)
         projected_query = self.Wq(query) # (bsz, query_len, d_query)
@@ -409,7 +495,13 @@ class SparseParallelLayer(nn.Module):
         logits = torch.einsum('bqhd,bkhd->bhqk', q_heads, k_heads)
         
         attention_scores = torch.softmax(logits/math.sqrt(self.d_query), dim=-1)
+        return attention_scores
 
+    def forward(self, key, value, target_len):
+        ################## estimate attention scores ###################
+        # key: (bsz, seq, num_heads, head_dim)
+        bsz, seq_len, num_heads, head_dim = key.shape
+        attention_scores = self.get_attention_scores(key, value)
         ################## gather keys and values ###################
         topk_indices, topk_probs = self.get_retrieve_indices(attention_scores, target_len)
         target_len = topk_indices.shape[-1] # the actual target len may be smaller than the expected
@@ -430,24 +522,20 @@ class SparseParallelLayer(nn.Module):
         return selected_keys, selected_values
 
 class SparseParallelPerceiver(TovaPruner):
-    def __init__(self, config, chunk_size, query_len, eval_query_len, d_query, d_model, num_layers, num_sink_tokens, model=None, **kwargs):
-        super().__init__(config, chunk_size, query_len, model, num_sink_tokens, **kwargs)
+    def __init__(self, config, chunk_size, query_len, eval_query_len, d_query, d_model, num_layers, model=None, **kwargs):
+        super().__init__(config, chunk_size, query_len, model, num_layers=num_layers, **kwargs)
         self.perceiver_layers = nn.ModuleList([
-            SparseParallelLayer(query_len, eval_query_len, d_query, d_model, num_sink_tokens)
+            self.build_perceiver_layer(query_len, eval_query_len, d_query, d_model)
             for i in range(num_layers)
         ])
 
         self.num_layers = num_layers
 
-    def compress(self, keys, values, attentions, target_len):
+    def compress_layer(self, key, value, attention, target_len, layer_idx):
         # print(f'param of W_Q at 1st layer: {self.perceiver_layers[0].Wq.weight.data}')
-        keeped_keys = []
-        keeped_values = []
-        assert len(keys) == self.num_layers
-        for i, (key, value, attention) in enumerate(zip(keys, values, attentions)):
-            #  we keep the sink tokens at each chunk
-            selected_keys, selected_values = self.perceiver_layers[i](key[:, self.num_sink_tokens:], value[:, self.num_sink_tokens:], target_len)
-            keeped_keys.append(torch.cat([key[:, :self.num_sink_tokens], selected_keys], dim=1))
-            keeped_values.append(torch.cat([value[:, :self.num_sink_tokens], selected_values], dim=1))
+        selected_keys, selected_values = self.perceiver_layers[layer_idx](key, value, target_len)
         # print(f'key shape before compression: {keys[0].shape}, after compress: {keeped_keys[0].shape}')
-        return keeped_keys, keeped_values
+        return selected_keys, selected_values
+    
+    def build_perceiver_layer(self, query_len, eval_query_len, d_query, d_model):
+        return SparseParallelLayer(query_len, eval_query_len, d_query, d_model)
