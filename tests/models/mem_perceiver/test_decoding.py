@@ -47,6 +47,7 @@ mem_perceiver_config = {
     "num_heads": num_heads,
     "num_layers": num_layers,
     # custom config
+    "memory_type": "increment_compressed_read_all_compressed",
     "query_len": query_len,
     "d_query": d_query,
     "chunk_size": chunk_size,
@@ -61,10 +62,10 @@ setattr(config.model_config, 'pe_config', pe_config)
 
 
 mem_perceiver = AutoPruner.from_pretrained(
-    compress_type="chunk_prefix",
+    pruner_type="parallel_sparse",
     config=config,
     pretrained_model_name_or_path=llm_name_or_path,
-    perceiver_path=None)
+    perceiver_path="ckpts/parallel_sparse_lr2e-05_memory_update_incremental_compressed_read_all_compressed/epoch_2")
 mem_perceiver = mem_perceiver.cuda()
 mem_perceiver.eval()
 
