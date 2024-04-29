@@ -12,7 +12,7 @@ from collie.controller.trainer import Trainer
 from collie.controller.evaluator import EvaluatorForPerplexity, EvaluatorForGeneration
 
 from collie.models import LlamaForCausalLM
-from collie.models.mem_perceiver import MemPerceiver, ParallelMemPerceiver, AutoPruner
+from collie.models.mem_perceiver import MemPerceiver, ParallelMemPerceiver, AutoPruner, AutoFuser
 
 from collie.utils.monitor import StepTimeMonitor, TGSMonitor, MemoryMonitor, LossMonitor, EvalMonitor, get_monitor
 from collie.metrics import DecodeMetric, PPLMetric
@@ -27,10 +27,20 @@ from copy import deepcopy
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--compress_type", type=str, choices=['parallel_fuse', 'pipeline_fuse', 'h2o', 'parallel_sparse', 'local_window', 'no_compress', 'streaming', 'random_prune', 'chunk_prefix', 'chunk_postfix', 'tova_pruner'])
+parser.add_argument("--pruner_type", type=str, choices=['parallel_fuse', 'pipeline_fuse', 'h2o', 'parallel_sparse', 'local_window', 'no_compress', 'streaming', 'random_prune', 'chunk_prefix', 'chunk_postfix', 'tova_pruner', None], default=None)
+parser.add_argument("--fuser_type", type=str, choices=['sparse_fuser', None], default=None)
 parser.add_argument("--do_train", action='store_true')
 parser.add_argument("--do_eval", action='store_true')
 parser.add_argument("--perceiver_path", type=str, default=None)
+parser.add_argument("--memory_type", type=str, default=None,
+                    choices=[
+                        'write_new_compressed_read_new_compressed',
+                        'increment_compressed_read_all_compressed',
+                        'update_incremental_compressed_read_all_compressed',
+                        'increment_all_read_retrieved',
+                        'increment_compressed_read_retrieved'
+                    ])
+parser.add_argument("--lr", type=float, default=1e-4)
 args = parser.parse_args()
 
 # 1. 设置路径
@@ -43,7 +53,7 @@ config = CollieConfig.from_pretrained(pretrained_model, trust_remote_code=True)
 config.tp_size = 1
 config.dp_size = 1
 config.pp_size = 1
-config.train_epochs = 1
+config.train_epochs = 3
 config.eval_per_n_steps = 1000
 config.eval_per_n_epochs = 1
 config.train_micro_batch_size = 4
@@ -56,7 +66,8 @@ config.ds_config = {
         },
         "tensorboard": {
             "enabled": True,
-            "output_path": f"./ds_tb_logs/{args.compress_type}",
+            "output_path": f"./ds_tb_logs/{args.pruner_type}",
+            "job_name": f"lr{args.lr}"
         },
         # "zero_allow_untested_optimizer": True,
         # "zero_force_ds_cpu_optimizer": False,
@@ -92,7 +103,8 @@ mem_perceiver_config = {
     "eval_query_len": eval_query_len,
     "num_heads": num_heads,
     "num_layers": num_layers,
-    "num_sink_tokens": 0,
+    "memory_type": args.memory_type,
+    "num_sink_tokens": 4,
     "temperature": 0.1
 }
 setattr(config, 'mem_perceiver_config', mem_perceiver_config) 
@@ -110,7 +122,7 @@ eval_context_len = 0
 eval_predict_len = 16384
 train_data_path = "/remote-home/share/personal/zyzeng/data/redpajama-15k-4k-llama/"
 # train_data_path = "/remote-home/share/personal/zyzeng/data/demo_1k/"
-eval_data_paths = ["awettig/github-sample-65536tokens-llama", "awettig/arxiv-sample-65536tokens-llama"]
+eval_data_paths = ["./eval_datasets/github_65k_llama_tokenized", "./eval_datasets/arxiv_65k_llama_tokenized"]
 
 def prepare_train_dataset(samples, max_seq_len):
     sub_samples = []
@@ -148,23 +160,29 @@ def prepare_eval_dataset(samples, eval_context_len, eval_predict_len):
 
 print('loading training and eval data', flush=True)
 train_dataset = prepare_train_dataset(datasets.load_from_disk(train_data_path), max_train_len)
-github_eval_dataset = prepare_eval_dataset(datasets.load_dataset(eval_data_paths[0])['train'], eval_context_len, eval_predict_len)
-arxiv_eval_dataset = prepare_eval_dataset(datasets.load_dataset(eval_data_paths[1])['train'], eval_context_len, eval_predict_len)
+print('finish loading training examples', flush=True)
+github_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[0])['train'], eval_context_len, eval_predict_len)
+arxiv_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[1])['train'], eval_context_len, eval_predict_len)
 
-print('example data: {}'.format(tokenizer.decode(train_dataset[0]['input_ids'])))
+# print('example data: {}'.format(tokenizer.decode(train_dataset[0]['input_ids'])))
 print(f'training set size: {len(train_dataset)}, github eval set size: {len(github_eval_dataset)}, arxiv eval set size: {len(arxiv_eval_dataset)}')
 
 # 5. 加载预训练模型
-model_for_training = AutoPruner.from_pretrained(compress_type=args.compress_type, config=config, pretrained_model_name_or_path=pretrained_model, perceiver_path=args.perceiver_path)
+if args.pruner_type is not None:
+    model_for_training = AutoPruner.from_pretrained(pruner_type=args.pruner_type, config=config, pretrained_model_name_or_path=pretrained_model, perceiver_path=args.perceiver_path)
+elif args.fuser_type is not None:
+    model_for_training = AutoFuser.from_pretrained(fuser_type=args.fuser_type, config=config, pretrained_model_name_or_path=pretrained_model, perceiver_path=args.perceiver_path)
+else:
+    raise NotImplementedError
 
-# 6. 设置优化器
+# # 6. 设置优化器
 if args.do_train:
     perceiver_parameters = []
     for n,p in model_for_training.named_parameters():
         if 'model.' not in n:
             print(n)
             perceiver_parameters.append(p)
-    optimizer = torch.optim.Adam(perceiver_parameters, lr=2e-5)
+    optimizer = torch.optim.Adam(perceiver_parameters, lr=args.lr)
 else:
     optimizer = None
 
@@ -202,7 +220,7 @@ arxiv_evaluator_ppl = EvaluatorForPerplexity(
 )
 
 callbacks = [
-    CheckpointCallback(f"/remote-home/zyzeng/collie/ckpts/{args.compress_type}",
+    CheckpointCallback(f"/remote-home/zyzeng/collie/ckpts/{args.pruner_type}_lr{args.lr}_memory_{args.memory_type}",
         every_n_epochs=1, # 每个 epoch 保存一次
         model_only=False, # 仅保存模型权重，不保存optimzer、训练步数等断点重训信息
     )
