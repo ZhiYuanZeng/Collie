@@ -24,40 +24,49 @@ class MemoryType(Enum):
     DYNAMIC_INCREMENTAL="Incremental_Chunk_Streaming_Dynamic_History"
     RETRIEVE_INCREMENTAL="Incremental_Chunk_Streaming_Retrieved_History"
     RETRIEVE_ALL_KV="Cache_All_KV_Retrieve_History"
-    
+
+@unique
+class PrunerType(Enum):
+    H2O="h2o"
+    STREAMING="streaming_llm"
+    CHUNK_PREFIX="chunk_prefix"
+    TOVA="tova"
+    RANDOM="random
+    LOCAL_WINDOW="local_window"
+    NO_COMPRESS="no_compress"
+    PERCEIVER="perceiver"
+
 class AutoPruner:
     @staticmethod
     def from_pretrained(pruner_type, pretrained_model_name_or_path, config, perceiver_path):
-        if pruner_type == 'h2o':
+        if pruner_type == PrunerType.H2O:
             config.use_flash = False
             print('Warning: the h2o pruner requires attention scores, therefore the flash_attention is set to False!')
             pruner = H2oPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == 'streaming':
+        elif pruner_type == PrunerType.STREAMING:
             pruner = StreamingLMPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == 'chunk_prefix':
+        elif pruner_type == PrunerType.CHUNK_PREFIX:
             pruner = ChunkPrefix.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == 'chunk_postfix':
-            pruner = ChunkPostfix.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == 'tova_pruner':
+        # elif pruner_type == PrunerType.CHUNK_POSTFIX:
+        #     pruner = ChunkPostfix.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+        elif pruner_type == PrunerType.TOVA:
             config.use_flash = False
             print('Warning: the h2o pruner requires attention scores, therefore the flash_attention is set to False!')
             pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == 'random_prune':
+        elif pruner_type == PrunerType.RANDOM:
             pruner = RandomPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == 'local_window': # remove context
+        elif pruner_type == PrunerType.LOCAL_WINDOW: # remove context
             config.mem_perceiver_config['query_len'] = 0
             pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == 'no_compress':
+        elif pruner_type == PrunerType.NO_COMPRESS:
             pruner = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path, config) # no compress
         # parameters required
-        elif pruner_type == 'parallel_sparse':
+        elif pruner_type == PrunerType.PERCEIVER:
             pruner = SparseParallelPerceiver.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         else:
             raise NotImplementedError
-        if pruner_type == 'h2o':
-            assert config.mem_perceiver_config['memory_type'] in ('write_new_compressed_read_new_compressed', 'update_incremental_compressed_read_all_compressed')
-        if pruner_type == 'tova_pruner':
-            assert config.mem_perceiver_config['memory_type'] in ('write_new_compressed_read_new_compressed', 'increment_compressed_read_all_compressed', 'update_incremental_compressed_read_all_compressed')
+        if pruner_type in (PrunerType.H2O, PrunerType.TOVA):
+            assert config.mem_perceiver_config['memory_type'] in (MemoryType.CHUNK_STREAMING, MemoryType.DYNAMIC_INCREMENTAL)
 
         return pruner
 
