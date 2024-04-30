@@ -15,7 +15,16 @@ from typing import Any
 from collie.utils import env
 from .utils import gradient_hook
 from functools import partial
+from enum import Enum, unique
 
+@unique
+class MemoryType(Enum):
+    CHUNK_STREAMING="Chunk_Streaming"
+    FIXED_INCREMENTAL="Incremental_Chunk_Streaming_Fixed_History"
+    DYNAMIC_INCREMENTAL="Incremental_Chunk_Streaming_Dynamic_History"
+    RETRIEVE_INCREMENTAL="Incremental_Chunk_Streaming_Retrieved_History"
+    RETRIEVE_ALL_KV="Cache_All_KV_Retrieve_History"
+    
 class AutoPruner:
     @staticmethod
     def from_pretrained(pruner_type, pretrained_model_name_or_path, config, perceiver_path):
@@ -138,13 +147,13 @@ class TovaPruner(CollieModelForCausalLM):
         if kwargs_of_compress_func['attention'] is not None:
             kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:,:,:,self.num_sink_tokens:]
         
-        if self.memory_type == 'write_new_compressed_read_new_compressed':
+        if self.memory_type == MemoryType.CHUNK_STREAMING:
             # 类似rmt读写compressed kv cache,但是每次写入会覆盖之前保存的compressed kv cache
             kwargs_of_compress_func['target_len'] = self.query_len # the compressed memory size is constant
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
             return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
         
-        elif self.memory_type == 'increment_compressed_read_all_compressed':
+        elif self.memory_type == MmemoryType.FIXED_INCREMENTAL:
             # 类似AutoCompresser, 压缩后的kv cache都缓存下来, 并且都被读取
             incremental_key = key[:, :-self.chunk_size]
             incremental_value = value[:, :-self.chunk_size]
@@ -152,13 +161,13 @@ class TovaPruner(CollieModelForCausalLM):
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
             return torch.cat([sink_key, incremental_key, compressed_key], dim=1), torch.cat([sink_value, incremental_value, compressed_value], dim=1)
         
-        elif self.memory_type == 'update_incremental_compressed_read_all_compressed':
+        elif self.memory_type == MemoryType.DYNAMIC_INCREMENTAL:
             # memory在随着chunk数量的增加而变长，但是每次增长会刷新整个memory，而incremental memory只会在之前的基础上拼接新的memory
             kwargs_of_compress_func['target_len'] = self.query_len * (chunk_step + 1) # incremental memory size
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
             return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
         
-        elif self.memory_type == 'increment_all_read_retrieved':
+        elif self.memory_type == MemoryType.RETRIEVE_INCREMENTAL:
             # 和inf-llm类似，保留所有kv cache,并检索
             kwargs_of_compress_func['target_len'] = self.query_len
             cached_key = self.cached_keys[layer_idx]
@@ -177,7 +186,7 @@ class TovaPruner(CollieModelForCausalLM):
                 self.cached_values[layer_idx] = torch.cat([cached_value, value], dim=1)
             return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
 
-        elif self.memory_type == 'increment_compressed_read_retrieved':
+        elif self.memory_type == MemoryType.RETRIEVE_ALL_KV:
             # 保留所有压缩后的kv cache,并检索
             kwargs_of_compress_func['target_len'] = self.query_len
             cached_key = self.cached_keys[layer_idx]
