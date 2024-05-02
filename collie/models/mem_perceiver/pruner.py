@@ -17,21 +17,19 @@ from .utils import gradient_hook
 from functools import partial
 from enum import Enum, unique
 
-@unique
-class MemoryType(Enum):
+class MemoryType:
     CHUNK_STREAMING="Chunk_Streaming"
     FIXED_INCREMENTAL="Incremental_Chunk_Streaming_Fixed_History"
     DYNAMIC_INCREMENTAL="Incremental_Chunk_Streaming_Dynamic_History"
     RETRIEVE_INCREMENTAL="Incremental_Chunk_Streaming_Retrieved_History"
     RETRIEVE_ALL_KV="Cache_All_KV_Retrieve_History"
 
-@unique
-class PrunerType(Enum):
+class PrunerType:
     H2O="h2o"
     STREAMING="streaming_llm"
     CHUNK_PREFIX="chunk_prefix"
     TOVA="tova"
-    RANDOM="random
+    RANDOM="random"
     LOCAL_WINDOW="local_window"
     NO_COMPRESS="no_compress"
     PERCEIVER="perceiver"
@@ -162,8 +160,8 @@ class TovaPruner(CollieModelForCausalLM):
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
             return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
         
-        elif self.memory_type == MmemoryType.FIXED_INCREMENTAL:
-            # 类似AutoCompresser, 压缩后的kv cache都缓存下来, 并且都被读取
+        elif self.memory_type == MemoryType.FIXED_INCREMENTAL:
+            # 类似AutoCompresser, 压缩后的kv cache都缓存下来, 且都被读取
             incremental_key = key[:, :-self.chunk_size]
             incremental_value = value[:, :-self.chunk_size]
             kwargs_of_compress_func['target_len'] = self.query_len # the compressed key size is constant
@@ -543,8 +541,8 @@ class SparseParallelLayer(nn.Module):
         return selected_keys, selected_values
 
 class SparseParallelPerceiver(TovaPruner):
-    def __init__(self, config, chunk_size, query_len, d_query, d_model, num_layers, eval_query_len=0, model=None, **kwargs):
-        super().__init__(config, chunk_size, query_len, model, num_layers=num_layers, **kwargs)
+    def __init__(self, config, chunk_size, query_len, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, d_query=0, d_model=0, eval_query_len=0, **kwargs):
+        super().__init__(config, chunk_size, query_len, model, num_sink_tokens, num_layers, memory_type, **kwargs)
         self.perceiver_layers = nn.ModuleList([
             self.build_perceiver_layer(query_len, eval_query_len, d_query, d_model)
             for i in range(num_layers)

@@ -75,10 +75,9 @@ class SparseFuserLayer(SparseParallelLayer):
         return fuse_keys, fuse_values
 
 class SparseFuserPerceiver(SparseParallelPerceiver):
-    def __init__(self, config, chunk_size, query_len, eval_query_len, d_query, d_model, num_layers, num_sink_tokens, num_heads, model=None, **kwargs):
+    def __init__(self, config, chunk_size, query_len, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, d_query=0, d_model=0, eval_query_len=0, num_heads=0, **kwargs):
         self.d_head = d_model // num_heads
-        super().__init__(config, chunk_size, query_len, eval_query_len, d_query, d_model, num_layers, num_sink_tokens, model, **kwargs)
+        super().__init__(config, chunk_size, query_len, model, num_sink_tokens, num_layers, memory_type, d_query, d_model, eval_query_len, **kwargs)
 
     def build_perceiver_layer(self, query_len, eval_query_len, d_query, d_model):
         return SparseFuserLayer(query_len, eval_query_len, d_query, d_model, self.d_head)
-    
