@@ -162,3 +162,8 @@ my_tests/
 docs/collie
 docs/source/api/generated
 docs/src/
+
+ckpts/
+ds_tb_logs/
+eval_datasets/
+logs/eval/

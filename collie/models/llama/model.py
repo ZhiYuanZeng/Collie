@@ -36,35 +36,6 @@ from collie.module import (
 from collie.utils import concat_tensor, dict_as_params, env, progress
 import numpy as np
 
-# class RotaryPositionEmbedding(nn.Module):
-#     def __init__(self, head_dim: int) -> None:
-#         super().__init__()
-#         inv_freq = 1.0 / (
-#             10000.0
-#             ** (torch.arange(0, head_dim, 2)[: (head_dim // 2)].float() / head_dim)
-#         )
-#         self.register_buffer("inv_freq", inv_freq)
-
-#     def forward(
-#         self, query: torch.Tensor, key: torch.Tensor, seq_len: int, start_pos: int = 0
-#     ):
-#         t = query.dtype
-#         query = torch.view_as_complex(query.float().reshape(*query.shape[:-1], -1, 2))
-#         key = torch.view_as_complex(key.float().reshape(*key.shape[:-1], -1, 2))
-#         freqs = torch.outer(
-#             torch.arange((2**16) * 2, device=self.inv_freq.device), self.inv_freq
-#         ).float()
-#         freqs_cis = torch.polar(torch.ones_like(freqs), freqs)[
-#             start_pos : start_pos + seq_len
-#         ]
-#         shape = [
-#             d if i == 1 or i == query.ndim - 1 else 1 for i, d in enumerate(query.shape)
-#         ]
-#         freqs_cis = freqs_cis.view(*shape)
-#         query = torch.view_as_real(query * freqs_cis).flatten(3)
-#         key = torch.view_as_real(key * freqs_cis).flatten(3)
-#         return query.type(t), key.type(t)
-
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     # x1 = x[..., :x.shape[-1] // 2]
