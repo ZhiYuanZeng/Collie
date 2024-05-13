@@ -123,6 +123,13 @@ class TovaPruner(CollieModelForCausalLM):
             attention_shape = (bsz, num_heads, seq_len, seq_len)
         else:
             attention_shape = attention.shape
+        if attention_shape[1] != num_heads:
+            # support gqa
+            assert attention_shape[1] % num_heads == 0
+            num_groups = attention_shape[1] // num_heads
+            attention = attention.view(bsz, num_groups, num_heads, -1, seq_len)
+            attention = attention.sum(dim=1)
+            assert attention.shape[1] == num_heads
         topk_indices = self.get_indices(attention, attention_shape, target_len).to(key.device)
         topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
         topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
