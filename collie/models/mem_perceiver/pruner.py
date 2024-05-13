@@ -246,9 +246,9 @@ class TovaPruner(CollieModelForCausalLM):
             do compress
         """
         seq_len = input_ids.shape[1]
-        if seq_len > self.chunk_size:
+        if seq_len > 1:
             chunked_input_ids = torch.split(input_ids, self.chunk_size, dim=1) # TODO: 支持长度无法被均分的情况
-            chunked_attention_mask = torch.split(attention_mask, self.chunk_size, dim=1)
+            # chunked_attention_mask = torch.split(attention_mask, self.chunk_size, dim=1)
             num_chunks = len(chunked_input_ids)
             
             cached_llm_outpus = []
