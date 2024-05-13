@@ -12,7 +12,7 @@ from collie.controller.trainer import Trainer
 from collie.controller.evaluator import EvaluatorForPerplexity, EvaluatorForGeneration
 
 from collie.models import LlamaForCausalLM
-from collie.models.mem_perceiver import MemPerceiver, ParallelMemPerceiver, AutoPruner, AutoFuser
+from collie.models.mem_perceiver import MemPerceiver, ParallelMemPerceiver, AutoPruner, AutoFuser, PrunerType, MemoryType, PrunerLoss
 
 from collie.utils.monitor import StepTimeMonitor, TGSMonitor, MemoryMonitor, LossMonitor, EvalMonitor, get_monitor
 from collie.metrics import DecodeMetric, PPLMetric
@@ -27,108 +27,118 @@ from copy import deepcopy
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--pruner_type", type=str, choices=['parallel_fuse', 'pipeline_fuse', 'h2o', 'parallel_sparse', 'local_window', 'no_compress', 'streaming', 'random_prune', 'chunk_prefix', 'chunk_postfix', 'tova_pruner', None], default=None)
+parser.add_argument("--pruner_type", type=str, choices=[
+                        PrunerType.CHUNK_PREFIX, PrunerType.H2O, PrunerType.LOCAL_WINDOW, PrunerType.NO_COMPRESS, 
+                        PrunerType.PERCEIVER, PrunerType.RANDOM, PrunerType.STREAMING, PrunerType.TOVA, None
+                    ], default=None)
 parser.add_argument("--fuser_type", type=str, choices=['sparse_fuser', None], default=None)
 parser.add_argument("--do_train", action='store_true')
 parser.add_argument("--do_eval", action='store_true')
 parser.add_argument("--perceiver_path", type=str, default=None)
-parser.add_argument("--memory_type", type=str, default=None,
-                    choices=[
-                        'write_new_compressed_read_new_compressed',
-                        'increment_compressed_read_all_compressed',
-                        'update_incremental_compressed_read_all_compressed',
-                        'increment_all_read_retrieved',
-                        'increment_compressed_read_retrieved'
-                    ])
+parser.add_argument("--memory_type", type=str, choices=[
+                        MemoryType.CHUNK_STREAMING, MemoryType.DYNAMIC_INCREMENTAL, MemoryType.FIXED_INCREMENTAL,
+                        MemoryType.RETRIEVE_ALL_KV, MemoryType.RETRIEVE_INCREMENTAL
+                    ], default=None)
 parser.add_argument("--lr", type=float, default=1e-4)
+parser.add_argument("--llm_model", type=str, choices=["llama2_7b", "tiny_llama", "pangu2_6b", "internlm2_7b"], default="llama2")
+parser.add_argument("--num_train_samples", type=int, default=None)
+parser.add_argument("--num_eval_samples", type=int, default=None)
+parser.add_argument("--chunk_size", type=int, default=None)
+parser.add_argument("--query_len", type=int, default=None)
+parser.add_argument("--compressed_chunk_size", type=int, default=None)
+parser.add_argument("--d_query", type=int, default=None)
+parser.add_argument("--use_flash", action='store_true', default=False)
+parser.add_argument("--num_gpus", type=int, default=1)
+parser.add_argument("--temperature", type=float, default=1.0)
 args = parser.parse_args()
-
 # 1. 设置路径
 # 1.1 预训练模型路径
-pretrained_model = "/remote-home/share/personal/zyzeng/models/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0"
+if args.llm_model == "llama2_7b":
+    pretrained_model = "/remote-home/share/models/llama_v2_hf/7b/"
+elif args.llm_model == "tiny_llama":
+    pretrained_model = "/remote-home/share/personal/zyzeng/models/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/"
+elif args.llm_model == "pangu2_6b":
+    pretrained_model = "imone/pangu_2_6B"
+elif args.llm_model == "internlm2_7b":
+    pretrained_model = "/remote-home/share/models/models--internlm2-7b"
+else:
+    raise NotImplementedError
 
 # 2. 设置配置
 # 2.1 加载配置
 config = CollieConfig.from_pretrained(pretrained_model, trust_remote_code=True)
 config.tp_size = 1
-config.dp_size = 1
+config.dp_size = args.num_gpus
 config.pp_size = 1
 config.train_epochs = 3
 config.eval_per_n_steps = 1000
 config.eval_per_n_epochs = 1
-config.train_micro_batch_size = 4
+config.train_micro_batch_size = 2
 config.gradient_accumulation_steps = 1
 config.eval_batch_size = 1
-config.use_flash = True
+config.use_flash = args.use_flash
+
+if args.pruner_type is not None:
+    tensorboard_dir = f"./ds_tb_logs/llm{args.llm_model}#pruner{args.pruner_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
+else:
+    tensorboard_dir = f"./ds_tb_logs/llm{args.llm_model}#fuser{args.pruner_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
+
 config.ds_config = {
-        "fp16": {
+        "bf16": {
             "enabled": True
         },
         "tensorboard": {
             "enabled": True,
-            "output_path": f"./ds_tb_logs/{args.pruner_type}",
+            "output_path": tensorboard_dir,
             "job_name": f"lr{args.lr}"
         },
-        # "zero_allow_untested_optimizer": True,
-        # "zero_force_ds_cpu_optimizer": False,
         # "zero_optimization": {
-        #     "stage": 2,
-        #     "offload_optimizer": {
-        #         "device": "cpu",
-        #         "pin_memory": False
-        #     }
+        #     "stage": 3,
         # }
 }
 config.checkpointing = True
 pe_config  = {'exp': False, '1d': False, 'imp': False, 'log': False, 
-          'exp_base': 4096, 'log_base': 4096, 'log_clip': 1, 'max_length': 2048, 
+          'exp_base': 4096, 'log_base': 4096, 'log_clip': 1, 'max_length': 4096, 
           'pi_lambda': 1, 'base': 10000.0, 'ntk_option': 'dynamic', 'ntk_alpha': 1., }
 setattr(config.model_config, 'pe_config', pe_config)
 
-chunk_size=512
-d_model=config.hidden_size
-d_query=config.hidden_size // 4
-d_ffn=config.hidden_size // 2
-num_heads=config.num_attention_heads
-train_query_len=64
-eval_query_len=64
-num_layers=config.num_hidden_layers
 
 mem_perceiver_config = {
-    "d_model": d_model,
-    "d_query": d_query,
-    "d_ffn": d_ffn,
-    "chunk_size": chunk_size,
-    "query_len": train_query_len,
-    "eval_query_len": eval_query_len,
-    "num_heads": num_heads,
-    "num_layers": num_layers,
+    "d_model": config.hidden_size // config.num_attention_heads * config.num_key_value_heads,
+    "d_query": args.d_query,
+    "chunk_size": args.chunk_size,
+    "query_len": args.query_len,
+    "compressed_chunk_size": args.compressed_chunk_size,
+    "num_heads": config.num_attention_heads,
+    "num_layers": config.num_hidden_layers,
     "memory_type": args.memory_type,
     "num_sink_tokens": 4,
-    "temperature": 0.1
+    "temperature": args.temperature
 }
 setattr(config, 'mem_perceiver_config', mem_perceiver_config) 
 
 
 # 3. 设置tokenizer
-tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=True, use_fast=False)
 
 # 4. 加载数据集
 max_train_len = 8192
-num_train_data = 15000 # 60M
-num_eval_data = 128
 eval_context_len = 0
 # eval_predict_len = 4096
 eval_predict_len = 16384
-train_data_path = "/remote-home/share/personal/zyzeng/data/redpajama-15k-4k-llama/"
-# train_data_path = "/remote-home/share/personal/zyzeng/data/demo_1k/"
-eval_data_paths = ["./eval_datasets/github_65k_llama_tokenized", "./eval_datasets/arxiv_65k_llama_tokenized"]
+if 'llama' in args.llm_model:
+    train_data_path = "/remote-home/share/personal/zyzeng/data/redpajama-15k-4k-llama/"
+    # train_data_path = "/remote-home/share/personal/zyzeng/data/demo_1k/"
+    eval_data_paths = ["./eval_datasets/github_65k_llama_tokenized", "./eval_datasets/arxiv_65k_llama_tokenized"]
+else:
+    train_data_path = "/remote-home/share/personal/wtshu/data/redpajama-15k-8k-internlm/train"
+    eval_data_paths = ["/remote-home/share/personal/wtshu/data/redpajama-15k-8k-internlm/test/github", "/remote-home/share/personal/wtshu/data/redpajama-15k-8k-internlm/test/arxiv"]
 
-def prepare_train_dataset(samples, max_seq_len):
+def prepare_train_dataset(samples, num_train_data, max_seq_len):
     sub_samples = []
     for sample in samples:
         sub_samples.append(sample)
-        if len(sub_samples) == num_train_data:
+        if num_train_data is not None and len(sub_samples) == num_train_data:
             break
     dataset = CollieDatasetForTraining([
         {
@@ -139,7 +149,7 @@ def prepare_train_dataset(samples, max_seq_len):
     ])
     return dataset
 
-def prepare_eval_dataset(samples, eval_context_len, eval_predict_len):
+def prepare_eval_dataset(samples, num_eval_data, eval_context_len, eval_predict_len):
     sub_samples = []
     for sample in samples:
         sample['labels'] = deepcopy(sample['input_ids'])
@@ -147,7 +157,7 @@ def prepare_eval_dataset(samples, eval_context_len, eval_predict_len):
             sample['labels'][:eval_context_len] = [-100 for _ in range(eval_context_len)]
         assert len(sample['labels']) == len(sample['input_ids'])
         sub_samples.append(sample)
-        if len(sub_samples) == num_eval_data:
+        if num_eval_data is not None and len(sub_samples) == num_eval_data:
             break
     dataset = CollieDatasetForTraining([
         {
@@ -159,11 +169,15 @@ def prepare_eval_dataset(samples, eval_context_len, eval_predict_len):
     return dataset
 
 print('loading training and eval data', flush=True)
-train_dataset = prepare_train_dataset(datasets.load_from_disk(train_data_path), max_train_len)
+train_dataset = prepare_train_dataset(datasets.load_from_disk(train_data_path), args.num_train_samples, max_train_len)
 print('finish loading training examples', flush=True)
-github_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[0])['train'], eval_context_len, eval_predict_len)
-arxiv_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[1])['train'], eval_context_len, eval_predict_len)
-
+try:
+    github_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[0])['train'], args.num_eval_samples, eval_context_len, eval_predict_len)
+    arxiv_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[1])['train'], args.num_eval_samples, eval_context_len, eval_predict_len)
+except Exception as e:
+    github_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[0]), args.num_eval_samples, eval_context_len, eval_predict_len)
+    arxiv_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[1]), args.num_eval_samples, eval_context_len, eval_predict_len)
+    
 # print('example data: {}'.format(tokenizer.decode(train_dataset[0]['input_ids'])))
 print(f'training set size: {len(train_dataset)}, github eval set size: {len(github_eval_dataset)}, arxiv eval set size: {len(arxiv_eval_dataset)}')
 
@@ -219,9 +233,16 @@ arxiv_evaluator_ppl = EvaluatorForPerplexity(
     }
 )
 
+if args.pruner_type is not None:
+    save_path = f"/remote-home/zyzeng/collie/ckpts/llm{args.llm_model}#pruner{args.pruner_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
+elif args.fuser_type is not None:
+    save_path = f"/remote-home/zyzeng/collie/ckpts/llm{args.llm_model}#fuser{args.fuser_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
+else:
+    raise RuntimeError("pruner type and fuser type can not be None at the same time")
 callbacks = [
-    CheckpointCallback(f"/remote-home/zyzeng/collie/ckpts/{args.pruner_type}_lr{args.lr}_memory_{args.memory_type}",
-        every_n_epochs=1, # 每个 epoch 保存一次
+    CheckpointCallback(save_path,
+        every_n_batches=1000, # 每个 epoch 保存一次
+        every_n_epochs=1,
         model_only=False, # 仅保存模型权重，不保存optimzer、训练步数等断点重训信息
     )
 ]
