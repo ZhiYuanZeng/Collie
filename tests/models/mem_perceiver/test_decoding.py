@@ -70,14 +70,36 @@ mem_perceiver = mem_perceiver.cuda()
 mem_perceiver.eval()
 
 # test generating
-data_path = "/remote-home/share/personal/zyzeng/data/redpajama-15k-4k-llama/"
-input_ids = prepare_data_for_eval(datasets.load_from_disk(data_path), batch_size, seq_len).cuda()
+data_path = "./eval_datasets/github_65k_llama_tokenized/"
 
-gen_config = GenerationConfig(max_new_tokens=20, early_stopping=True, eos_token_id=2)
-tokenizer = AutoTokenizer.from_pretrained(llm_name_or_path)
-with autocast(): 
-    model_outputs = mem_perceiver.generate(input_ids, generation_config=gen_config)
+tokenizer = AutoTokenizer.from_pretrained(llm_name_or_path, trust_remote_code=True)
 
-for i, generated_sequence in enumerate(model_outputs):
-    generated_text = tokenizer.decode(generated_sequence, skip_special_tokens=True)
-    # print(f"Generated text {i+1}: {generated_text}")
+class MeasureGPUTime:
+    def __enter__(self):
+        self.start_event = torch.cuda.Event(enable_timing=True)
+        self.end_event = torch.cuda.Event(enable_timing=True)
+        self.start_event.record()  # 记录开始时间
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.end_event.record()  # 记录结束时间
+        torch.cuda.synchronize()  # 等待 GPU 完成所有操作
+        self.execution_time = self.start_event.elapsed_time(self.end_event) / 1000.0  # 计算执行时间（以秒为单位）
+        print(f"函数的执行时间为: {self.execution_time:.6f} 秒")
+
+mem_perceiver = mem_perceiver.to(torch.bfloat16)
+
+# seq_lens = [8192]
+# num_tokens_to_generate = [2]
+seq_lens = [8192, 16000, 32000]
+num_tokens_to_generate = [2, 64, 256, 1024]
+for s in seq_lens:
+    print(f'input {s} tokens'+'.'*20)
+    input_ids = prepare_data_for_eval(datasets.load_from_disk(data_path)['train'], batch_size, s).cuda()
+
+    for ntg in num_tokens_to_generate:
+        print(f'generate {ntg} tokens', flush=True)
+        gen_config = GenerationConfig(max_new_tokens=ntg, min_new_tokens=ntg, early_stopping=True, eos_token_id=2)
+
+        with MeasureGPUTime():
+            model_outputs = mem_perceiver.generate(input_ids, generation_config=gen_config)
+            assert model_outputs.shape[-1] == s + ntg, f'{model_outputs.shape=}, {input_ids.shape=}'
