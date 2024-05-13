@@ -341,11 +341,18 @@ class TovaPruner(CollieModelForCausalLM):
 
     @classmethod
     def from_pretrained(cls, model_path_or_name: str, config: CollieConfig, perceiver_path=None, **kwargs):
-        model = LlamaForCausalLM.from_pretrained(model_path_or_name, config=config)
-        mem_perceiver = cls.from_config(config=config, model=model)
+        model = build_llm_from_name_or_path(model_path_or_name, config)
         if perceiver_path is not None:
+            try:
+                load_config = CollieConfig.from_pretrained(perceiver_path, trust_remote_code=True)
+                config.mem_perceiver_config['query_len'] = load_config.mem_perceiver_config['query_len']
+            except Exception:
+                pass
+            mem_perceiver = cls.from_config(config=config, model=model)
             state_dict = cls.load_parallel_state_dict(perceiver_path)
             mem_perceiver.load_state_dict(state_dict)
+        else:
+            mem_perceiver = cls.from_config(config=config, model=model)
         return mem_perceiver
 
 class H2oPruner(TovaPruner):
