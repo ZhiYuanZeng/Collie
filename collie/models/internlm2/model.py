@@ -398,15 +398,19 @@ class InternLM2Attention(nn.Module):
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
             # reuse k, v, self_attention
+            query_states = torch.nn.functional.pad(query_states, (0,0, past_key_value[0].shape[-2],0))
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            assert query_states.shape[2] == kv_seq_len
 
         past_key_value = (key_states, value_states) if use_cache else None
 
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        if past_key_value is not None:
+            query_states = query_states[:, :, -q_len:]
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
@@ -504,15 +508,17 @@ class InternLM2FlashAttention2(InternLM2Attention):
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
             # reuse k, v, self_attention
+            query_states = torch.nn.functional.pad(query_states, (0,0, past_key_value[0].shape[-2],0))
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
+            assert position_ids.shape[1] == kv_seq_len, f'{position_ids.shape[1]=}, {kv_seq_len=}'
         past_key_value = (key_states, value_states) if use_cache else None
-
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        if past_key_value is not None:
+            query_states = query_states[:, :, -q_len:]
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
@@ -647,7 +653,7 @@ class InternLM2DecoderLayer(nn.Module):
         # 务必保持变量名一致
         self.use_cache = self.config.model_config.use_cache
         self.hidden_states = None
-        self.output_attentions = False
+        self.output_attentions = True
 
     def _forward(
         self,
@@ -683,9 +689,13 @@ class InternLM2DecoderLayer(nn.Module):
             if past_key_value is not None:
                 past_key_values_length = past_key_value[0][0].shape[1]
             device = hidden_states.device
+            # position_ids = torch.arange(
+            #     past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+            # )
             position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+                seq_length + past_key_values_length, dtype=torch.long, device=device
             )
+
             position_ids = position_ids.unsqueeze(0)
 
         # Self Attention
@@ -705,14 +715,13 @@ class InternLM2DecoderLayer(nn.Module):
         hidden_states = self.ffn_norm(hidden_states)
         hidden_states = self.feed_forward(hidden_states)
         hidden_states = residual + hidden_states
-
-        return hidden_states, present_key_value
+        return hidden_states, present_key_value, self_attn_weights
 
     def forward(self, inputs: dict):
         layer_past = inputs_to_kv_cache_for_layer(idx=self.idx, inputs=inputs)
 
         if self.config.checkpointing and self.training:
-            hidden_states, new_layer_past = torch.utils.checkpoint.checkpoint(
+            hidden_states, new_layer_past, self_attn_weights = torch.utils.checkpoint.checkpoint(
                 self._forward,
                 inputs["hidden_states"],
                 inputs.get("attention_mask", None),
@@ -720,13 +729,14 @@ class InternLM2DecoderLayer(nn.Module):
                 layer_past,
             )
         else:
-            hidden_states, new_layer_past = self._forward(
+            hidden_states, new_layer_past, self_attn_weights = self._forward(
                 inputs["hidden_states"],
                 inputs.get("attention_mask", None),
                 inputs.get("position_ids", None),
                 layer_past
             )  # **inputs
         inputs["hidden_states"] = hidden_states
+        inputs[f"attention_score_{self.idx}"] = self_attn_weights
 
         inputs.update(kv_cache_to_inputs_for_layer(idx=self.idx, new_layer_past=new_layer_past))
         return inputs
@@ -933,10 +943,9 @@ class InternLM2Model(nn.Module):
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+                seq_length + past_key_values_length, dtype=torch.long, device=device
             )
             position_ids = position_ids.unsqueeze(0)
-
         if inputs_embeds is None:
             inputs_embeds = self.tok_embeddings(input_ids)
 
@@ -978,6 +987,7 @@ class InternLM2Model(nn.Module):
             inputs.update(layer(inputs))
         inputs["hidden_states"] = self.norm(inputs["hidden_states"])
         all_hidden_states += (inputs["hidden_states"],)
+        attention_scores = [inputs[f"attention_score_{i}"] for i,_ in enumerate(self.layers)]
 
         past_key_values = inputs_to_kv_cache_for_model(self.config.num_hidden_layers, inputs)
 
@@ -985,6 +995,7 @@ class InternLM2Model(nn.Module):
             last_hidden_state=inputs["hidden_states"],
             hidden_states=all_hidden_states,
             past_key_values=past_key_values,
+            attentions=attention_scores
         )
 
     @classmethod
@@ -1036,7 +1047,7 @@ class InternLM2ForCausalLM(CollieModelForCausalLM):
     _tied_weights_keys = ["output.weight"]
     base_model_prefix = "model"
 
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__(config)
         self.model = InternLM2Model(config)
         self.vocab_size = config.vocab_size
@@ -1077,6 +1088,11 @@ class InternLM2ForCausalLM(CollieModelForCausalLM):
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         **kwargs,
     ):
+        # FIXME: 这些transpose会带来更多的显存消耗
+        if past_key_values is not None:
+            past_key_values = [
+                (kv[0].transpose(1, 2).contiguous(), kv[1].transpose(1, 2).contiguous()) 
+                    for kv in past_key_values]
         output = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1084,12 +1100,16 @@ class InternLM2ForCausalLM(CollieModelForCausalLM):
             **kwargs,
         )
         logits = self.output(output.last_hidden_state)
+        if output.past_key_values is not None:
+            output.past_key_values = [
+                (kv[0].transpose(1, 2).contiguous(), kv[1].transpose(1, 2).contiguous()) 
+                    for kv in output.past_key_values]
         return CausalLMOutputWithPast(
             loss=None,
             logits=logits,
             past_key_values=output.past_key_values,
             hidden_states=output.hidden_states,
-            attentions=None,
+            attentions=output.attentions,
         )
 
     def prepare_inputs_for_generation(
@@ -1108,12 +1128,13 @@ class InternLM2ForCausalLM(CollieModelForCausalLM):
             input_ids = input_ids[:, remove_prefix_length:]
 
         position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
+        # FIXME: we only consider the batch size=1 at inference currently
+        # if attention_mask is not None and position_ids is None:
+        #     # create position_ids on the fly for batch generation
+        #     position_ids = attention_mask.long().cumsum(-1) - 1
+        #     position_ids.masked_fill_(attention_mask == 0, 1)
+        #     if past_key_values:
+        #         position_ids = position_ids[:, -input_ids.shape[1] :]
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
