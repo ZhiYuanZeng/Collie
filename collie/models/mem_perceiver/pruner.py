@@ -369,8 +369,8 @@ class H2oPruner(TovaPruner):
 
         cached_accum_scores = self.accum_attention_scores[layer_idx]
         if cached_accum_scores is not None:
-            assert accum_attention_scores.shape[-1] == cached_accum_scores.shape[-1] + self.chunk_size, f'{attention.shape}, {accum_attention_scores.shape[-1]=}, {cached_accum_scores.shape[-1]=} {self.chunk_size=}'
-            accum_attention_scores[:, :, :-self.chunk_size] += cached_accum_scores
+            # assert accum_attention_scores.shape[-1] == cached_accum_scores.shape[-1] + self.chunk_size, f'{attention.shape}, {accum_attention_scores.shape[-1]=}, {cached_accum_scores.shape[-1]=} {self.chunk_size=}'
+            accum_attention_scores[:, :, :cached_accum_scores.shape[-1]] += cached_accum_scores
 
         # print(normalization_scores)
         important_indices = torch.topk(accum_attention_scores, dim=-1, k=target_len).indices
