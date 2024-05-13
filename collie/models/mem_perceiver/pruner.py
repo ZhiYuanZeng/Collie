@@ -7,7 +7,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from collie.models.base import CollieModelForCausalLM
-from collie.models import LlamaForCausalLM
+from collie.models import LlamaForCausalLM, InternLM2ForCausalLM
 from collie.config import CollieConfig
 import math
 import random
@@ -33,6 +33,13 @@ class PrunerType:
     LOCAL_WINDOW="local_window"
     NO_COMPRESS="no_compress"
     PERCEIVER="perceiver"
+
+def build_llm_from_name_or_path(model_name_or_path, config):
+    if 'llama' in model_name_or_path:
+        model = LlamaForCausalLM.from_pretrained(model_name_or_path, config=config, trust_remote_code=True)
+    else:
+        model = InternLM2ForCausalLM.from_pretrained(model_name_or_path, config=config, trust_remote_code=True)
+    return model
 
 class AutoPruner:
     @staticmethod
