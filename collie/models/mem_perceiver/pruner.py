@@ -471,7 +471,7 @@ class PerceiverPrunerLayer(nn.Module):
         topk_values, topk_indices = torch.topk(important_scores, dim=-1, k=target_len)
         return topk_indices, topk_values
     
-    def get_retrieve_indices(self, attention, target_len):
+    def get_indices_pos_routing(self, attention, target_len):
         # 为了排除不同query检索的内容重复，需要先对kv做分区，每个query对应单独的区域
         # attention: (bsz, num_heads, query_len, kv_len)
         # TODO: handel the case that target_len is not divided by query_len
@@ -483,7 +483,6 @@ class PerceiverPrunerLayer(nn.Module):
             assert attention.shape == (bsz, num_heads, query_len, kv_len+num_pad)
         else:
             num_pad = 0
-        assert query_len == self.query_len
         assert target_len % query_len == 0
         num_tokens_per_query = (kv_len+num_pad) // query_len
         attention = attention.reshape(bsz, num_heads, query_len, query_len, num_tokens_per_query)
@@ -505,6 +504,32 @@ class PerceiverPrunerLayer(nn.Module):
             topk_probs = topk_probs[:, :, non_overflow_indices]
         assert torch.all(topk_probs >= 0) and torch.all(topk_indices < kv_len)
         return topk_indices, topk_probs
+
+    def get_indices_random_routing(self, attention, target_len):
+        shuffle_indices = list(range(attention.shape[-1]))
+        random.shuffle(shuffle_indices)
+        shuffle_indices = torch.tensor(shuffle_indices, device=attention.device)
+        attention = attention[:,:,:,shuffle_indices]
+        topk_indices, topk_probs = self.get_indices_pos_routing(attention, target_len)
+        bsz, num_heads, _ = topk_indices.shape
+        indices_len = len(shuffle_indices)
+        topk_indices = torch.gather(shuffle_indices.view(1,1,indices_len).expand(bsz, num_heads, indices_len), 
+                                    dim=-1, index=topk_indices)
+        return topk_indices, topk_probs
+    
+    def get_indices_greedy_routing(self, attention, target_len):
+        # take each query as an expert
+        bsz, num_heads, query_len, kv_len = attention.shape
+        token_expert_indices = torch.argmax(attention, dim=-2) # each token select one expert (query), shape: (bsz, num_heads, kv_len)
+        mask = nn.functional.one_hot(token_expert_indices, num_classes=query_len).transpose(-1, -2) # (bsz, num_heads, query_len, kv_len)
+        masked_attention = attention + mask.type_as(attention) # 优先考虑token选择专家结果，因为这些选择之间没有重合，这些选择都考虑完了，再考虑专家选择token的概率
+        
+        token_per_query = target_len // self.query_len # capacity
+        topk_probs, expert_token_indices = torch.topk(masked_attention, dim=-1, k=token_per_query)
+        expert_token_indices = expert_token_indices.view(bsz, num_heads, -1)
+        topk_probs = topk_probs.view(bsz, num_heads, -1)
+                
+        return expert_token_indices, topk_probs
 
     def get_attention_scores(self, key, value):
         bsz, seq_len, num_heads, head_dim = key.shape
