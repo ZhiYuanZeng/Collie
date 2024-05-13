@@ -565,13 +565,13 @@ class PerceiverPrunerLayer(nn.Module):
         attention_scores = torch.softmax(logits/self.temperature, dim=-1)
         return attention_scores
 
-    def forward(self, key, value, target_len):
+    def forward(self, key, value, attention, target_len):
         ################## estimate attention scores ###################
         # key: (bsz, seq, num_heads, head_dim)
         bsz, seq_len, num_heads, head_dim = key.shape
         attention_scores = self.get_attention_scores(key, value)
         ################## gather keys and values ###################
-        topk_indices, topk_probs = self.get_retrieve_indices(attention_scores, target_len)
+        topk_indices, topk_probs = self.get_indices_random_routing(attention_scores, target_len)
         target_len = topk_indices.shape[-1] # the actual target len may be smaller than the expected
         topk_indices, sort_indices = torch.sort(topk_indices, dim=-1)
         topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
