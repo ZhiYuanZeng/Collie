@@ -547,8 +547,13 @@ class PerceiverPrunerLayer(nn.Module):
 
     def get_attention_scores(self, key, value):
         bsz, seq_len, num_heads, head_dim = key.shape
-        query_len = self.query_len if self.training else self.eval_query_len
-        query = self.query[:query_len].unsqueeze(dim=0).expand(bsz, query_len, -1)
+        if self.compressed_chunk_size < self.query_len and not self.training:
+            query_len = self.compressed_chunk_size
+            query = self.query[:query_len]
+        else:
+            query_len = self.query_len
+            query = self.query
+        query = query.unsqueeze(dim=0).expand(bsz, query_len, -1)
         projected_query = self.Wq(query) # (bsz, query_len, d_query)
         projected_key = self.Wk(key.view(bsz, seq_len, -1)) # (bsz, seq_len, d_query)
         
