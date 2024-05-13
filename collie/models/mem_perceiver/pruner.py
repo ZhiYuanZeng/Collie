@@ -441,7 +441,7 @@ class ChunkPostfix(TovaPruner):
         return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
 
 
-class SparseParallelLayer(nn.Module):
+class PerceiverPrunerLayer(nn.Module):
     def __init__(self, query_len, compressed_chunk_size, d_query, d_model, chunk_size, temperature) -> None:
         super().__init__()
         self.query_len = query_len
@@ -450,7 +450,8 @@ class SparseParallelLayer(nn.Module):
         self.query = nn.Parameter(torch.randn(query_len, d_query))
         self.Wq = nn.Linear(d_query, d_query, bias=False)
         self.Wk = nn.Linear(d_model, d_query, bias=False)
-        self.d_query = d_query
+        self.chunk_size = chunk_size
+        self.temperature = temperature
     
     def get_random_indices(self, attention, target_len, segment_size=1):
         bsz, num_heads, seq_len = attention.shape[0], attention.shape[1], attention.shape[-1]
@@ -550,21 +551,25 @@ class SparseParallelLayer(nn.Module):
             self.mse_loss = None
         return selected_keys, selected_values
 
-class SparseParallelPerceiver(TovaPruner):
-    def __init__(self, config, chunk_size, query_len, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, d_query=0, d_model=0, eval_query_len=0, **kwargs):
-        super().__init__(config, chunk_size, query_len, model, num_sink_tokens, num_layers, memory_type, **kwargs)
+class PerceiverPruner(TovaPruner):
+    def __init__(self, config, chunk_size, query_len, compressed_chunk_size=0, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, d_query=0, d_model=0, temperature=1.0, **kwargs):
+        super().__init__(config, chunk_size, compressed_chunk_size, model, num_sink_tokens, num_layers, memory_type, **kwargs)
         self.perceiver_layers = nn.ModuleList([
-            self.build_perceiver_layer(query_len, eval_query_len, d_query, d_model)
+            self.build_perceiver_layer(query_len, compressed_chunk_size, d_query, d_model, chunk_size, temperature)
             for i in range(num_layers)
         ])
-
+        self.query_len = query_len
         self.num_layers = num_layers
+        self.temperature = temperature
 
     def compress_layer(self, key, value, attention, target_len, layer_idx):
         # print(f'param of W_Q at 1st layer: {self.perceiver_layers[0].Wq.weight.data}')
-        selected_keys, selected_values = self.perceiver_layers[layer_idx](key, value, target_len)
+        selected_keys, selected_values = self.perceiver_layers[layer_idx](key, value, attention, target_len)
         # print(f'key shape before compression: {keys[0].shape}, after compress: {keeped_keys[0].shape}')
         return selected_keys, selected_values
+    
+    def build_perceiver_layer(self, query_len, compressed_chunk_size, d_query, d_model, chunk_size, temperature):
+        return PerceiverPrunerLayer(query_len, compressed_chunk_size, d_query, d_model, chunk_size, temperature)
     
     def forward(self, input_ids: Any | None = None, attention_mask: Any | None = None, past_key_values: Tuple | None = None, **kwargs):
         outputs = super().forward(input_ids, attention_mask, past_key_values, **kwargs)
