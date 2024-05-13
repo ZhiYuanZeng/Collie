@@ -16,6 +16,7 @@ from collie.utils import env
 from .utils import gradient_hook
 from functools import partial
 from enum import Enum, unique
+from collie.module import GPTLMLoss
 
 class MemoryType:
     CHUNK_STREAMING="Chunk_Streaming"
@@ -539,8 +540,14 @@ class SparseParallelLayer(nn.Module):
         selected_values = torch.gather(value, dim=1, index=topk_indices)
         if topk_probs is not None:
             selected_keys = selected_keys * (1 + topk_probs - topk_probs.detach()) # straight-through trick
-            selected_values = selected_values * (1 + topk_probs - topk_probs.detach())
-
+        if attention is not None:
+            target_scores = attention[:, :, -self.chunk_size:, :].mean(dim=2)
+            model_scores = attention_scores.mean(dim=2)
+            assert target_scores.shape == model_scores.shape
+            mse_loss = torch.mean((attention.shape[-1]*(target_scores - model_scores))**2)
+            self.mse_loss = mse_loss
+        else:
+            self.mse_loss = None
         return selected_keys, selected_values
 
 class SparseParallelPerceiver(TovaPruner):
@@ -559,5 +566,25 @@ class SparseParallelPerceiver(TovaPruner):
         # print(f'key shape before compression: {keys[0].shape}, after compress: {keeped_keys[0].shape}')
         return selected_keys, selected_values
     
-    def build_perceiver_layer(self, query_len, eval_query_len, d_query, d_model):
-        return SparseParallelLayer(query_len, eval_query_len, d_query, d_model)
+    def forward(self, input_ids: Any | None = None, attention_mask: Any | None = None, past_key_values: Tuple | None = None, **kwargs):
+        outputs = super().forward(input_ids, attention_mask, past_key_values, **kwargs)
+        avg_mse_loss = 0
+        for layer_idx in range(self.num_layers):
+            mse_loss = getattr(self.perceiver_layers[layer_idx], 'mse_loss', None)
+            if mse_loss is not None:
+                avg_mse_loss += mse_loss
+                # self.perceiver_layers[layer_idx].mse_loss = None
+        avg_mse_loss /= self.num_layers
+        if avg_mse_loss != 0:
+            setattr(outputs, 'mse_loss', avg_mse_loss)
+        return outputs
+
+class PrunerLoss(GPTLMLoss):
+    def __init__(self, ignore_index=-100, aux_loss_weight=0.):
+        super().__init__(ignore_index)
+        self.aux_loss_weight = aux_loss_weight
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor, mse_loss: torch.Tensor):
+        lm_loss = super().forward(logits, labels)
+        mse_loss = mse_loss * self.aux_loss_weight
+        return lm_loss + mse_loss
