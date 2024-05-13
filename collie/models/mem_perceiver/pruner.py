@@ -557,7 +557,7 @@ class PerceiverPrunerLayer(nn.Module):
         
         logits = torch.einsum('bqhd,bkhd->bhqk', q_heads, k_heads)
         
-        attention_scores = torch.softmax(logits/math.sqrt(self.d_query), dim=-1)
+        attention_scores = torch.softmax(logits/self.temperature, dim=-1)
         return attention_scores
 
     def forward(self, key, value, target_len):
