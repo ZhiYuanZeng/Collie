@@ -79,19 +79,37 @@ config.eval_batch_size = 1
 config.use_flash = args.use_flash
 
 if args.pruner_type is not None:
-    tensorboard_dir = f"./ds_tb_logs/llm{args.llm_model}#pruner{args.pruner_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
+    # tensorboard_dir = f"./ds_tb_logs/llm{args.llm_model}#pruner{args.pruner_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
+    group=f"pruner_{args.pruner_type}"
+    tag = f"llm{args.llm_model}#pruner{args.pruner_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}"
 else:
-    tensorboard_dir = f"./ds_tb_logs/llm{args.llm_model}#fuser{args.pruner_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
-
+    group=f"fuser_{args.fuser_type}"
+    # tensorboard_dir = f"./ds_tb_logs/llm{args.llm_model}#fuser{args.fuser_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
+    tag = f"llm{args.llm_model}#fuser{args.fuser_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}"
 config.ds_config = {
         "bf16": {
             "enabled": True
         },
-        "tensorboard": {
+        "monitor_config": {
             "enabled": True,
-            "output_path": tensorboard_dir,
-            "job_name": f"lr{args.lr}"
+            "tag": tag,  # job name
+            "wandb": {
+                "enabled": True,
+                "project": "kvcache-compress",
+                "team": "zyzeng",
+                "group": group,
+            },
+            "tensorboard": {
+                "enabled": True,
+                "output_path": "./ds_tb_logs/",
+            },
+
+            "csv_monitor": {
+                "enabled": True,
+                "output_path": "./ds_csv_logs/",
+            }
         },
+
         # "zero_optimization": {
         #     "stage": 3,
         # }
