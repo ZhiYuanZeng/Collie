@@ -37,10 +37,12 @@ class PrunerType:
     PERCEIVER="perceiver"
 
 def build_llm_from_name_or_path(model_name_or_path, config):
-    if 'llama' in model_name_or_path:
+    if 'llama' in model_name_or_path.lower():
         model = LlamaForCausalLM.from_pretrained(model_name_or_path, config=config, trust_remote_code=True)
-    else:
+    elif 'internlm' in model_name_or_path.lower() or 'moss' in model_name_or_path.lower():
         model = InternLM2ForCausalLM.from_pretrained(model_name_or_path, config=config, trust_remote_code=True)
+    else:
+        raise NotImplementedError
     return model
 
 class AutoPruner:
@@ -587,7 +589,7 @@ class PerceiverPrunerLayer(nn.Module):
         random.shuffle(shuffle_indices)
         shuffle_indices = torch.tensor(shuffle_indices, device=attention.device)
         attention = attention[:,:,:,shuffle_indices]
-        topk_indices, topk_probs = self.get_indices_pos_routing(attention, target_len)
+        topk_indices, topk_probs = self.get_indices_random_routing(attention, target_len)
         bsz, num_heads, _ = topk_indices.shape
         indices_len = len(shuffle_indices)
         topk_indices = torch.gather(shuffle_indices.view(1,1,indices_len).expand(bsz, num_heads, indices_len), 
@@ -600,6 +602,8 @@ class PerceiverPrunerLayer(nn.Module):
         token_expert_indices = torch.argmax(attention, dim=-2) # each token select one expert (query), shape: (bsz, num_heads, kv_len)
         mask = nn.functional.one_hot(token_expert_indices, num_classes=query_len).transpose(-1, -2) # (bsz, num_heads, query_len, kv_len)
         masked_attention = attention + mask.type_as(attention) # 优先考虑token选择专家结果，因为这些选择之间没有重合，这些选择都考虑完了，再考虑专家选择token的概率
+        # num_tokens_each_query = masked_attention.sum(dim=-1)
+        # num_target_tokens_each_query = (num_tokens_each_query / kv_len * target_len).int()
         
         token_per_query = target_len // self.query_len # capacity
         topk_probs, expert_token_indices = torch.topk(masked_attention, dim=-1, k=token_per_query)
@@ -634,7 +638,7 @@ class PerceiverPrunerLayer(nn.Module):
         bsz, seq_len, num_heads, head_dim = key.shape
         attention_scores = self.get_attention_scores(key, value)
         ################## gather keys and values ###################
-        topk_indices, topk_probs = self.get_indices_random_routing(attention_scores, target_len)
+        topk_indices, topk_probs = self.get_random_indices(attention_scores, target_len)
         target_len = topk_indices.shape[-1] # the actual target len may be smaller than the expected
         topk_indices, sort_indices = torch.sort(topk_indices, dim=-1)
         topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
