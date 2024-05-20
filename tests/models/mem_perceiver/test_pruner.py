@@ -40,7 +40,7 @@ mem_perceiver_config = {
     "num_heads": num_heads,
     "num_layers": num_layers,
     "num_sink_tokens": 4,
-    "memory_type": "increment_compressed_read_all_compressed"
+    "memory_type": "Chunk_Streaming"
 }
 pe_config  = {'exp': False, '1d': False, 'imp': False, 'log': False, 
           'exp_base': 4096, 'log_base': 4096, 'log_clip': 1, 'max_length': 2048, 
