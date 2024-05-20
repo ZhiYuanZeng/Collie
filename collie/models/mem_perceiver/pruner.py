@@ -178,6 +178,10 @@ class TovaPruner(CollieModelForCausalLM):
             # 类似AutoCompresser, 压缩后的kv cache都缓存下来, 且都被读取
             incremental_key = key[:, :-self.chunk_size]
             incremental_value = value[:, :-self.chunk_size]
+            key = key[:, -self.chunk_size:]
+            value = value[:, -self.chunk_size:]
+            if kwargs_of_compress_func['attention'] is not None:
+                kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:, :, :, -self.chunk_size:]
             kwargs_of_compress_func['target_len'] = self.compressed_chunk_size # the compressed key size is constant
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
             return torch.cat([sink_key, incremental_key, compressed_key], dim=1), torch.cat([sink_value, incremental_value, compressed_value], dim=1)
