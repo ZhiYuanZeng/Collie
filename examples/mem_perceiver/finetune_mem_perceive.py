@@ -31,13 +31,14 @@ parser.add_argument("--pruner_type", type=str, choices=[
                         PrunerType.CHUNK_PREFIX, PrunerType.H2O, PrunerType.LOCAL_WINDOW, PrunerType.NO_COMPRESS, 
                         PrunerType.PERCEIVER, PrunerType.RANDOM, PrunerType.STREAMING, PrunerType.TOVA, None
                     ], default=None)
-parser.add_argument("--fuser_type", type=str, choices=['sparse_fuser', None], default=None)
+parser.add_argument("--fuser_type", type=str, choices=['perceiver', 'llm', None], default=None)
 parser.add_argument("--do_train", action='store_true')
 parser.add_argument("--do_eval", action='store_true')
 parser.add_argument("--perceiver_path", type=str, default=None)
 parser.add_argument("--memory_type", type=str, choices=[
                         MemoryType.CHUNK_STREAMING, MemoryType.DYNAMIC_INCREMENTAL, MemoryType.FIXED_INCREMENTAL,
-                        MemoryType.RETRIEVE_ALL_KV, MemoryType.RETRIEVE_INCREMENTAL
+                        MemoryType.RETRIEVE_ALL_KV, MemoryType.RETRIEVE_INCREMENTAL, MemoryType.RETRIEVE_DYNAMIC_INCREMENTAL,
+                        MemoryType.DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS
                     ], default=None)
 parser.add_argument("--lr", type=float, default=1e-4)
 parser.add_argument("--llm_model", type=str, choices=["llama2_7b", "tiny_llama", "pangu2_6b", "internlm2_7b"], default="llama2")
@@ -50,6 +51,9 @@ parser.add_argument("--d_query", type=int, default=None)
 parser.add_argument("--use_flash", action='store_true', default=False)
 parser.add_argument("--num_gpus", type=int, default=1)
 parser.add_argument("--temperature", type=float, default=1.0)
+parser.add_argument("--eval_every", type=int, default=1000)
+parser.add_argument("--eval_len", type=int, default=16384)
+parser.add_argument("--train_epochs", type=int, default=1)
 args = parser.parse_args()
 # 1. 设置路径
 # 1.1 预训练模型路径
@@ -70,8 +74,8 @@ config = CollieConfig.from_pretrained(pretrained_model, trust_remote_code=True)
 config.tp_size = 1
 config.dp_size = args.num_gpus
 config.pp_size = 1
-config.train_epochs = 3
-config.eval_per_n_steps = 1000
+config.train_epochs = args.train_epochs
+config.eval_per_n_steps = args.eval_every
 config.eval_per_n_epochs = 1
 config.train_micro_batch_size = 2
 config.gradient_accumulation_steps = 1
@@ -135,6 +139,13 @@ mem_perceiver_config = {
 }
 setattr(config, 'mem_perceiver_config', mem_perceiver_config) 
 
+# 5. 加载预训练模型
+if args.pruner_type is not None:
+    model_for_training = AutoPruner.from_pretrained(pruner_type=args.pruner_type, config=config, pretrained_model_name_or_path=pretrained_model, perceiver_path=args.perceiver_path)
+elif args.fuser_type is not None:
+    model_for_training = AutoFuser.from_pretrained(fuser_type=args.fuser_type, config=config, pretrained_model_name_or_path=pretrained_model, perceiver_path=args.perceiver_path)
+else:
+    raise NotImplementedError
 
 # 3. 设置tokenizer
 tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=True, use_fast=False)
@@ -199,13 +210,6 @@ except Exception as e:
 # print('example data: {}'.format(tokenizer.decode(train_dataset[0]['input_ids'])))
 print(f'training set size: {len(train_dataset)}, github eval set size: {len(github_eval_dataset)}, arxiv eval set size: {len(arxiv_eval_dataset)}')
 
-# 5. 加载预训练模型
-if args.pruner_type is not None:
-    model_for_training = AutoPruner.from_pretrained(pruner_type=args.pruner_type, config=config, pretrained_model_name_or_path=pretrained_model, perceiver_path=args.perceiver_path)
-elif args.fuser_type is not None:
-    model_for_training = AutoFuser.from_pretrained(fuser_type=args.fuser_type, config=config, pretrained_model_name_or_path=pretrained_model, perceiver_path=args.perceiver_path)
-else:
-    raise NotImplementedError
 
 # # 6. 设置优化器
 if args.do_train:
@@ -249,9 +253,9 @@ arxiv_evaluator_ppl = EvaluatorForPerplexity(
 )
 
 if args.pruner_type is not None:
-    save_path = f"/remote-home/zyzeng/collie/ckpts/llm{args.llm_model}#pruner{args.pruner_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
+    save_path = f"/remote-home/zyzeng/collie/ckpts/llm{args.llm_model}#pruner{args.pruner_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#compress{args.compressed_chunk_size}"
 elif args.fuser_type is not None:
-    save_path = f"/remote-home/zyzeng/collie/ckpts/llm{args.llm_model}#fuser{args.fuser_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
+    save_path = f"/remote-home/zyzeng/collie/ckpts/llm{args.llm_model}#fuser{args.fuser_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#compress{args.compressed_chunk_size}"
 else:
     raise RuntimeError("pruner type and fuser type can not be None at the same time")
 if args.fuser_type != 'llm':
