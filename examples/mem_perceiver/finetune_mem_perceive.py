@@ -37,7 +37,7 @@ parser.add_argument("--do_eval", action='store_true')
 parser.add_argument("--perceiver_path", type=str, default=None)
 parser.add_argument("--memory_type", type=str, choices=[
                         MemoryType.CHUNK_STREAMING, MemoryType.DYNAMIC_INCREMENTAL, MemoryType.FIXED_INCREMENTAL,
-                        MemoryType.RETRIEVE_ALL_KV, MemoryType.RETRIEVE_INCREMENTAL, MemoryType.RETRIEVE_DYNAMIC_INCREMENTAL,
+                        MemoryType.RETRIEVE_ALL_KV, MemoryType.RETRIEVE_INCREMENTAL,
                         MemoryType.DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS
                     ], default=None)
 parser.add_argument("--lr", type=float, default=1e-4)
@@ -198,8 +198,12 @@ def prepare_eval_dataset(samples, num_eval_data, eval_context_len, eval_predict_
     return dataset
 
 print('loading training and eval data', flush=True)
-train_dataset = prepare_train_dataset(datasets.load_from_disk(train_data_path), args.num_train_samples, max_train_len)
-print('finish loading training examples', flush=True)
+if args.do_train:
+    train_dataset = prepare_train_dataset(datasets.load_from_disk(train_data_path), args.num_train_samples, max_train_len)
+    print('finish loading training examples', flush=True)
+else:
+    train_dataset = []
+
 try:
     github_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[0])['train'], args.num_eval_samples, eval_context_len, eval_predict_len)
     arxiv_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[1])['train'], args.num_eval_samples, eval_context_len, eval_predict_len)
