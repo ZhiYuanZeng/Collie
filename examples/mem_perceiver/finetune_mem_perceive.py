@@ -153,11 +153,11 @@ tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=Tr
 # 4. 加载数据集
 max_train_len = 8192
 eval_context_len = 0
-# eval_predict_len = 4096
-eval_predict_len = 16384
+eval_predict_len = args.eval_len
 if 'llama' in args.llm_model:
-    train_data_path = "/remote-home/share/personal/zyzeng/data/redpajama-15k-4k-llama/"
+    # train_data_path = "/remote-home/share/personal/zyzeng/data/redpajama-15k-4k-llama/"
     # train_data_path = "/remote-home/share/personal/zyzeng/data/demo_1k/"
+    train_data_path = "/remote-home/zyzeng/data/redpajama-1b-8k-llama"
     eval_data_paths = ["./eval_datasets/github_65k_llama_tokenized", "./eval_datasets/arxiv_65k_llama_tokenized"]
 else:
     train_data_path = "/remote-home/share/personal/wtshu/data/redpajama-15k-8k-internlm/train"
@@ -168,14 +168,14 @@ def prepare_train_dataset(samples, num_train_data, max_seq_len):
     for sample in samples:
         sub_samples.append(sample)
         if num_train_data is not None and len(sub_samples) == num_train_data:
-            break
+            break   
     dataset = CollieDatasetForTraining([
         {
             'tokens': torch.tensor(sample['input_ids'])[:max_seq_len],
-            'output': torch.tensor(sample['labels'])[:max_seq_len],
+            'labels': torch.tensor(sample['labels'])[:max_seq_len],
             'attention_mask': torch.tensor(sample['attention_mask'])[:max_seq_len],
         } for sample in sub_samples
-    ])
+    ], shuffle=True)
     return dataset
 
 def prepare_eval_dataset(samples, num_eval_data, eval_context_len, eval_predict_len):
@@ -191,7 +191,7 @@ def prepare_eval_dataset(samples, num_eval_data, eval_context_len, eval_predict_
     dataset = CollieDatasetForTraining([
         {
             'tokens': torch.tensor(sample['input_ids'])[:eval_context_len+eval_predict_len],
-            'output': torch.tensor(sample['labels'])[:eval_context_len+eval_predict_len],
+            'labels': torch.tensor(sample['labels'])[:eval_context_len+eval_predict_len],
             'attention_mask': torch.ones(len(sample['input_ids'])).long()[:eval_context_len+eval_predict_len],
         } for sample in sub_samples
     ])
