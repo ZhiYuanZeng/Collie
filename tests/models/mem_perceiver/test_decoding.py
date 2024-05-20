@@ -23,22 +23,23 @@ def prepare_data_for_eval(samples, bsz, seq_len):
     )
     return input_ids
 
-llm_name_or_path = "/remote-home/share/personal/zyzeng/models/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0"
+# llm_name_or_path = "/remote-home/share/models/internlm2-7b-base-hf/"
+llm_name_or_path = "/remote-home/share/models/llama_v2_hf/7b/"
+# llm_name_or_path = "/remote-home/share/storage/zyyin/moss2Huawei"
 
 # config
 config = CollieConfig.from_pretrained(llm_name_or_path,
         trust_remote_code=True)
 config.checkpointing = True
-config.use_flash = False
+config.use_flash = True
 
-batch_size=2
-seq_len=1028
-chunk_size=512
-d_model=config.hidden_size
+batch_size=1
+chunk_size=256
+d_model=config.hidden_size // config.num_attention_heads * config.num_key_value_heads
 d_query=config.hidden_size // 4
 d_ffn=config.hidden_size // 2
 num_heads=config.num_key_value_heads
-query_len=chunk_size // 8
+compressed_chunk_size=chunk_size // 8
 num_layers=config.model_config.num_hidden_layers
 
 mem_perceiver_config = {
@@ -47,12 +48,14 @@ mem_perceiver_config = {
     "num_heads": num_heads,
     "num_layers": num_layers,
     # custom config
-    "memory_type": MemoryType.CHUNK_STREAMING,
-    "query_len": query_len,
+    "memory_type": MemoryType.DYNAMIC_INCREMENTAL,
+    "query_len": compressed_chunk_size,
+    "compressed_chunk_size": compressed_chunk_size,
     "d_query": d_query,
     "chunk_size": chunk_size,
     "num_sink_tokens": 4,
 }
+print(mem_perceiver_config)
 setattr(config, 'mem_perceiver_config', mem_perceiver_config) 
 
 pe_config  = {'exp': False, '1d': False, 'imp': False, 'log': False, 
@@ -64,8 +67,8 @@ setattr(config.model_config, 'pe_config', pe_config)
 mem_perceiver = AutoPruner.from_pretrained(
     pruner_type=PrunerType.PERCEIVER,
     config=config,
-    pretrained_model_name_or_path=llm_name_or_path,
-    perceiver_path="ckpts/parallel_sparse_lr2e-05_memory_update_incremental_compressed_read_all_compressed/epoch_2")
+    pretrained_model_name_or_path=llm_name_or_path)
+    # perceiver_path="ckpts/parallel_sparse_lr2e-05_memory_update_incremental_compressed_read_all_compressed/epoch_2")
 mem_perceiver = mem_perceiver.cuda()
 mem_perceiver.eval()
 
