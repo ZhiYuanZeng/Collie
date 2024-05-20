@@ -209,12 +209,9 @@ else:
 
 # # 6. 设置优化器
 if args.do_train:
-    perceiver_parameters = []
-    for n,p in model_for_training.named_parameters():
-        if 'model.' not in n:
-            print(n)
-            perceiver_parameters.append(p)
-    optimizer = torch.optim.Adam(perceiver_parameters, lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model_for_training.parameters()), lr=args.lr
+    )
 else:
     optimizer = None
 
@@ -257,23 +254,13 @@ elif args.fuser_type is not None:
     save_path = f"/remote-home/zyzeng/collie/ckpts/llm{args.llm_model}#fuser{args.fuser_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
 else:
     raise RuntimeError("pruner type and fuser type can not be None at the same time")
-if args.fuser_type != 'llm':
-    callbacks = [
-        CheckpointCallback(save_path,
-            every_n_batches=1000, # 每个 epoch 保存一次
-            every_n_epochs=1,
-            model_only=False, # 仅保存模型权重，不保存optimzer、训练步数等断点重训信息
-        )
-    ]
-else:
-    callbacks=[
-        CheckpointCallback(
-            folder=save_path,
-            every_n_batches=1000, # 每个 epoch 保存一次
-            every_n_epochs=1,
-            peft_only=True,
-        )
-    ]
+callbacks = [
+    CheckpointCallback(save_path,
+        every_n_batches=1000, # 每个 epoch 保存一次
+        every_n_epochs=1,
+        model_only=False, # 仅保存模型权重，不保存optimzer、训练步数等断点重训信息
+    )
+]
 
 # 9. 实例化trainer
 trainer = Trainer(
