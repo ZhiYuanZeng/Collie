@@ -22,6 +22,7 @@ class MemoryType:
     CHUNK_STREAMING="Chunk_Streaming"
     FIXED_INCREMENTAL="Incremental_Chunk_Streaming_Fixed_History"
     DYNAMIC_INCREMENTAL="Incremental_Chunk_Streaming_Dynamic_History"
+    DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS="dynamic_incremental_double_compress"
     RETRIEVE_INCREMENTAL="Incremental_Chunk_Streaming_Retrieved_History"
     RETRIEVE_ALL_KV="Cache_All_KV_Retrieve_History"
 
@@ -71,7 +72,7 @@ class AutoPruner:
             pruner = PerceiverPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         else:
             raise NotImplementedError
-        if pruner_type in (PrunerType.H2O, PrunerType.TOVA):
+        if pruner_type in (PrunerType.H2O):
             assert config.mem_perceiver_config['memory_type'] in (MemoryType.CHUNK_STREAMING, MemoryType.DYNAMIC_INCREMENTAL)
 
         return pruner
@@ -90,6 +91,7 @@ class TovaPruner(CollieModelForCausalLM):
         self.memory_type = memory_type
         self.cached_keys = [None for _ in range(num_layers)]
         self.cached_values = [None for _ in range(num_layers)]
+        self.cached_attentions = [None for _ in range(num_layers)]
     
     def frozen_model(self):
         for p in self.model.parameters():
@@ -104,20 +106,32 @@ class TovaPruner(CollieModelForCausalLM):
         mem_perceiver.frozen_model()
         return mem_perceiver
 
-    def get_indices(self, attention, attention_shape, target_len):
+    def get_indices(self, attention, attention_shape, target_len, cached_attention=None):
         assert attention is not None
         chunk_size = min(self.chunk_size, attention.shape[-1])
         new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
         accum_attention_scores = new_attention_scores.sum(dim = 2) # (bsz, num_heads, seq_len)
+
         normalization_scores = torch.ones(attention.shape[-1], device=attention.device) * chunk_size
         normalization_scores[-chunk_size:] = chunk_size - torch.arange(chunk_size, device=attention.device)
         # print(normalization_scores)
         important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
-        important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
-        important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
-        return important_indices
+        if cached_attention is not None:
+            # the cached attention is for incremental fixed memory
+            # print(self.cached_attentions[layer_idx].shape, attention.shape)
+            important_scores = torch.cat([cached_attention, important_scores], dim=-1)
 
-    def compress_layer(self, key, value, attention, target_len, layer_idx):
+        important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
+        double_compressed_indices = important_indices[:, :, :self.compressed_chunk_size]
+
+        important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
+        double_compressed_indices, _ = torch.sort(double_compressed_indices, dim=-1) # 方便位置编码
+
+        selected_attention = torch.gather(important_scores, index=important_indices, dim=-1)
+        cached_attention = selected_attention
+        return important_indices, double_compressed_indices, cached_attention
+
+    def compress_layer(self, key, value, attention, target_len, layer_idx, double_compress=False):
         bsz, seq_len, num_heads, head_dim = key.shape
         if attention is None:
             attention_shape = (bsz, num_heads, seq_len, seq_len)
@@ -127,18 +141,37 @@ class TovaPruner(CollieModelForCausalLM):
             # support gqa
             assert attention_shape[1] % num_heads == 0
             num_groups = attention_shape[1] // num_heads
-            attention = attention.view(bsz, num_groups, num_heads, -1, seq_len)
+            attention = attention.view(bsz, num_groups, num_heads, attention.shape[-2], attention.shape[-1])
             attention = attention.sum(dim=1)
             assert attention.shape[1] == num_heads
-        topk_indices = self.get_indices(attention, attention_shape, target_len).to(key.device)
+        
+        if attention_shape[-1] != seq_len:
+            cached_attention = self.cached_attentions[layer_idx]
+        else:
+            cached_attention = None
+        topk_indices, double_compressed_indices, cached_attention = self.get_indices(attention, attention_shape, target_len, cached_attention)
+        topk_indices = topk_indices.to(key.device)
+        double_compressed_indices = double_compressed_indices.to(key.device)
+
+        self.cached_attentions[layer_idx] = cached_attention
+
         topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
         topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
 
         selected_keys = torch.gather(key, index=topk_indices, dim=1)
         selected_values = torch.gather(value, index=topk_indices, dim=1)
         assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
-        return selected_keys, selected_values
-    
+
+        if double_compress:
+            double_compressed_indices = double_compressed_indices.unsqueeze(dim=-1).expand(bsz, num_heads, self.compressed_chunk_size, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
+            double_compressed_indices = double_compressed_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
+
+            double_compressed_keys = torch.gather(key, index=double_compressed_indices, dim=1)
+            double_compressed_values = torch.gather(value, index=double_compressed_indices, dim=1)
+            return selected_keys, selected_values, double_compressed_keys, double_compressed_values
+        else:
+            return selected_keys, selected_values
+
     def compress(self, keys, values, attentions, chunk_step):
         keeped_keys = []
         keeped_values = []
@@ -192,7 +225,30 @@ class TovaPruner(CollieModelForCausalLM):
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
             return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
         
-        elif self.memory_type == MemoryType.RETRIEVE_INCREMENTAL:
+        elif self.memory_type == MemoryType.DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS:
+            # 只保留新的chunk的kv,否则memory中会存在很多重复元素
+            key = key[:, -self.chunk_size:]
+            value = value[:, -self.chunk_size:]
+            if kwargs_of_compress_func['attention'] is not None:
+                kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:, :, :, -self.chunk_size:]
+
+            cached_key = self.cached_keys[layer_idx]
+            cached_value = self.cached_values[layer_idx]
+
+            if cached_key is not None:
+                kwargs_of_compress_func['key'] = torch.cat([cached_key, kwargs_of_compress_func['key']], dim=1)
+                kwargs_of_compress_func['value'] = torch.cat([cached_value, kwargs_of_compress_func['value']], dim=1)
+
+            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size * (chunk_step + 1) # incremental memory size
+            kwargs_of_compress_func['double_compress'] = True
+            compressed_key, compressed_value, double_compressed_keys, double_compressed_value = compress_func(**kwargs_of_compress_func)
+
+            self.cached_keys[layer_idx] = compressed_key
+            self.cached_values[layer_idx] = compressed_value
+
+            return torch.cat([sink_key, double_compressed_keys], dim=1), torch.cat([sink_value, double_compressed_value], dim=1)
+
+        elif self.memory_type == MemoryType.RETRIEVE_ALL_KV:
             # 和inf-llm类似，保留所有kv cache,并检索
             kwargs_of_compress_func['target_len'] = self.compressed_chunk_size
             cached_key = self.cached_keys[layer_idx]
@@ -211,14 +267,21 @@ class TovaPruner(CollieModelForCausalLM):
                 self.cached_values[layer_idx] = torch.cat([cached_value, value], dim=1)
             return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
 
-        elif self.memory_type == MemoryType.RETRIEVE_ALL_KV:
+        elif self.memory_type == MemoryType.RETRIEVE_INCREMENTAL:
             # 保留所有压缩后的kv cache,并检索
             kwargs_of_compress_func['target_len'] = self.compressed_chunk_size
+            # remove the retrieved kv
+            key = key[:, -self.chunk_size:]
+            value = value[:, -self.chunk_size:]
+            if kwargs_of_compress_func['attention'] is not None:
+                kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:, :, :, -self.chunk_size:]
+
             cached_key = self.cached_keys[layer_idx]
             cached_value = self.cached_values[layer_idx]
+
             if cached_key is not None:
-                kwargs_of_compress_func['key'] = cached_key
-                kwargs_of_compress_func['value'] = cached_value
+                kwargs_of_compress_func['key'] = torch.cat([cached_key, kwargs_of_compress_func['key']], dim=1)
+                kwargs_of_compress_func['value'] = torch.cat([cached_value, kwargs_of_compress_func['value']], dim=1)
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
 
             if cached_key is None:
@@ -316,6 +379,7 @@ class TovaPruner(CollieModelForCausalLM):
     def clear_perceiver_cache(self):
         self.cached_keys = [None for _ in range(self.num_layers)]
         self.cached_values = [None for _ in range(self.num_layers)]
+        self.cached_attentions = [None for _ in range(self.num_layers)]
 
     @staticmethod
     def save_parallel_state_dict(state_dict: dict,
@@ -430,19 +494,14 @@ class StreamingLMPruner(TovaPruner):
 
 class RandomPruner(TovaPruner):
     # sink tokens + random tokens
-    def get_indices(self, attention, attention_shape, target_len, segment_size=1):
+    def get_indices(self, attention, attention_shape, target_len, *args, **kwargs):
         bsz, num_heads, seq_len = attention_shape[0], attention_shape[1], attention_shape[-1]
-        assert seq_len % segment_size == 0
-        assert target_len % segment_size == 0
-        target_segment_num = target_len // segment_size
-        segment_num = seq_len // segment_size
         assert seq_len >= target_len
-        segment_indices = random.sample(range(segment_num), target_segment_num)
-        token_indices = torch.arange(seq_len).view(segment_num, segment_size)[segment_indices]
-        token_indices = token_indices.view(-1)
-        token_indices[:self.num_sink_tokens] = torch.arange(self.num_sink_tokens)
-        # assert len(token_indices) == target_len
-        return token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
+        sample_indices = random.sample(range(seq_len), target_len)
+        token_indices = torch.arange(seq_len)[sample_indices]
+        token_indices = token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
+        double_compressed_indices = token_indices[:, :, :self.compressed_chunk_size]
+        return token_indices, double_compressed_indices, None
 
 class ChunkPrefix(TovaPruner):
     def get_indices(self, attention, attention_shape, target_len):
@@ -479,7 +538,7 @@ class PerceiverPrunerLayer(nn.Module):
         segment_num = seq_len // segment_size
         assert seq_len >= target_len
         segment_indices = random.sample(range(segment_num), target_segment_num)
-        token_indices = torch.arange(seq_len).view(segment_num, segment_size)[segment_indices]
+        token_indices = torch.arange(seq_len, device=attention.device).view(segment_num, segment_size)[segment_indices]
         token_indices = token_indices.view(-1)
         # assert len(token_indices) == target_len
         return token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len), None
