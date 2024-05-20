@@ -15,20 +15,26 @@ from typing import Any
 from collie.utils import env
 from .utils import gradient_hook
 from functools import partial
-from .pruner import PerceiverPruner, PerceiverPrunerLayer
+from .pruner import PerceiverPruner, PerceiverPrunerLayer, TovaPruner, build_llm_from_name_or_path, MemoryType
+from peft import LoraConfig, TaskType
+from peft import get_peft_model
+from collie.utils.peft_utils import load_peft
+
 
 class AutoFuser:
     @staticmethod
     def from_pretrained(fuser_type, pretrained_model_name_or_path, config, perceiver_path):
-        if fuser_type == 'sparse_fuser':
-            pruner = SparseFuserPerceiver.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+        if fuser_type == 'perceiver':
+            fuser = SparseFuserPerceiver.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+        elif fuser_type == 'llm':
+            fuser = LLMFuser.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         else:
             raise NotImplementedError
-        return pruner
+        return fuser
 
 class SparseFuserLayer(PerceiverPrunerLayer):
-    def __init__(self, query_len, eval_query_len, d_query, d_model, d_head, chunk_size, temperature) -> None:
-        super().__init__(query_len, eval_query_len, d_query, d_model, chunk_size)
+    def __init__(self, query_len, compressed_chunk_size, d_query, d_model, d_head, chunk_size, temperature) -> None:
+        super().__init__(query_len, compressed_chunk_size, d_query, d_model, chunk_size, temperature)
         self.k_fuse = nn.Parameter(torch.eye(d_head))
         self.v_fuse = nn.Parameter(torch.eye(d_head))
         self.k_attn_layer_norm = nn.LayerNorm(d_head)
@@ -45,7 +51,7 @@ class SparseFuserLayer(PerceiverPrunerLayer):
 
     def get_attention_scores(self, key, value):
         bsz, seq_len, num_heads, head_dim = key.shape
-        query_len = self.query_len if self.training else self.eval_query_len
+        query_len = self.query_len if self.training else self.compressed_chunk_size
         query = self.query[:query_len].unsqueeze(dim=0).expand(bsz, query_len, -1)
         projected_query = self.Wq(query) # (bsz, query_len, d_query)
         projected_key = self.Wk(key.view(bsz, seq_len, -1)) # (bsz, seq_len, d_query)
@@ -93,7 +99,7 @@ class SparseFuserLayer(PerceiverPrunerLayer):
 
         ################## gather keys and values ###################
         topk_indices, topk_probs = self.get_indices_pos_routing(attention_scores, target_len)
-        
+        target_len = topk_indices.shape[-1]
         topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
         topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
         if topk_probs is not None:
@@ -111,10 +117,219 @@ class SparseFuserLayer(PerceiverPrunerLayer):
         return fused_keys, fused_values * (1 + topk_probs - topk_probs.detach())
 
 class SparseFuserPerceiver(PerceiverPruner):
-    def __init__(self, config, chunk_size, query_len, eval_query_len, model=None, num_sink_tokens=0, 
+    def __init__(self, config, chunk_size, query_len, compressed_chunk_size, model=None, num_sink_tokens=0, 
                  num_layers=0, memory_type=None, d_query=0, d_model=0, num_heads=0, temperature=1.0, **kwargs):
         self.d_head = d_model // num_heads
-        super().__init__(config, chunk_size, query_len, eval_query_len, model, num_sink_tokens, num_layers, memory_type, d_query, d_model, temperature, **kwargs)
+        super().__init__(config, chunk_size, query_len, compressed_chunk_size, model, num_sink_tokens, num_layers, memory_type, d_query, d_model, temperature, **kwargs)
 
-    def build_perceiver_layer(self, query_len, eval_query_len, d_query, d_model, chunk_size, temperature):
-        return SparseFuserLayer(query_len, eval_query_len, d_query, d_model, self.d_head, chunk_size, temperature)
+    def build_perceiver_layer(self, query_len, compressed_chunk_size, d_query, d_model, chunk_size, temperature):
+        return SparseFuserLayer(query_len, compressed_chunk_size, d_query, d_model, self.d_head, chunk_size, temperature)
+
+class LLMFuser(TovaPruner):
+    def __init__(self, config, chunk_size, compressed_chunk_size=0, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, query_len=0, **kwargs):
+        super().__init__(config, chunk_size, compressed_chunk_size, model, num_sink_tokens, num_layers, memory_type)
+        self.query_len = query_len
+
+    @classmethod
+    def from_pretrained(cls, model_path_or_name: str, config: CollieConfig, perceiver_path=None, **kwargs):
+        # TODO: get lora config from args
+        model = build_llm_from_name_or_path(model_path_or_name, config)
+        mem_perceiver = cls.from_config(config=config, model=model) # wrapper does not need peft
+        peft_config = LoraConfig(
+            base_model_name_or_path=model_path_or_name,
+            r=8,
+            lora_alpha=32,
+            target_modules=[
+                "q_proj",
+                "v_proj",
+                "k_proj",
+            ],
+            lora_dropout=0.1,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            modules_to_save=["embed_tokens"]
+        )
+        mem_perceiver.agument_embedding()
+        mem_perceiver = get_peft_model(mem_perceiver, peft_config)
+
+        mem_perceiver.print_trainable_parameters()
+        print('Trainable parameters:...............')
+        for n,p in mem_perceiver.named_parameters():
+            if p.requires_grad:
+                print(n)
+        if perceiver_path is not None:
+            load_peft(mem_perceiver, config, perceiver_path)
+        return mem_perceiver
+
+    @staticmethod
+    def save_parallel_state_dict(state_dict: dict,
+        path: str,
+        config,
+        process_exclusion: bool = False,
+        protocol: str = "file",
+    ):
+        if env.rank == 0:
+            embed_state_dict = {}
+            for k,v in state_dict.items():
+                embed_state_dict[k] = v
+            
+            torch.save(embed_state_dict, path + '/embed_weights.bin')
+
+    @staticmethod
+    def load_parallel_state_dict(path:str):
+        state_dict = torch.load(path + '/embed_weights.bin', map_location='cpu')
+        return state_dict
+            
+    def frozen_model(self):
+        # peft would frozen the model automatically
+        pass
+
+    def agument_embedding(self):
+        vocab_size = self.model.config.vocab_size
+        self.memory_token_offset = vocab_size
+        self.model.resize_token_embeddings(vocab_size + 1)
+        # self.memory_token_embed = nn.Embedding(self.chunk_size, embedding_dim=self.config.hidden_size)
+
+    def read_and_write_memory(self, compress_func, **kwargs_of_compress_func):
+        chunk_step = kwargs_of_compress_func.pop('chunk_step')
+        # write short-term memory to long-term memory, read from memory
+        keys = kwargs_of_compress_func['keys']
+        values = kwargs_of_compress_func['values']
+        sink_keys = [key[:, :self.num_sink_tokens] for key in keys]
+        sink_values = [value[:, :self.num_sink_tokens] for value in values]
+        keys = [key[:, self.num_sink_tokens:] for key in keys]
+        values = [value[:, self.num_sink_tokens:] for value in values]
+        kwargs_of_compress_func['keys'] = keys
+        kwargs_of_compress_func['values'] = values
+        
+        if self.memory_type == MemoryType.CHUNK_STREAMING:
+            # 类似rmt读写compressed kv cache,但是每次写入会覆盖之前保存的compressed kv cache
+            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size # the compressed memory size is constant
+            compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
+            return [(torch.cat([sink_keys[i], compressed_key[i]], dim=1), torch.cat([sink_values[i], compressed_value[i]], dim=1)) for i in range(self.num_layers)]
+        
+        elif self.memory_type == MemoryType.FIXED_INCREMENTAL:
+            # 类似AutoCompresser, 压缩后的kv cache都缓存下来, 且都被读取
+            incremental_keys = [key[:, :-self.chunk_size] for key in keys]
+            incremental_values = [value[:, :-self.chunk_size] for value in values]
+            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size # the compressed key size is constant
+            compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
+            return [(torch.cat([sink_keys[i], incremental_keys[i], compressed_key[i]], dim=1), torch.cat([sink_values[i], incremental_values[i], compressed_value[i]], dim=1)) for i in range(self.num_layers)]
+        
+        elif self.memory_type == MemoryType.DYNAMIC_INCREMENTAL:
+            # memory在随着chunk数量的增加而变长，但是每次增长会刷新整个memory，而incremental memory只会在之前的基础上拼接新的memory
+            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size * (chunk_step + 1) # incremental memory size
+            compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
+            return [(torch.cat([sink_keys[i], compressed_key[i]], dim=1), torch.cat([sink_values[i], compressed_value[i]], dim=1)) for i in range(self.num_layers)]
+        elif self.memory_type == MemoryType.DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS:
+            keys = [key[:, -self.chunk_size:] for key in keys]
+            values = [value[:, -self.chunk_size:] for value in values]
+
+            cached_keys = self.cached_keys
+            cached_values = self.cached_values
+
+            if cached_keys[0] is not None:
+                kwargs_of_compress_func['keys'] = [torch.cat([ck, k], dim=1) for ck,k in zip(cached_keys, keys)]
+                kwargs_of_compress_func['values'] = [torch.cat([cv, v], dim=1) for cv,v in zip(cached_values, values)]
+
+            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size * (chunk_step + 1) # incremental memory size
+            kwargs_of_compress_func['double_compress'] = True
+            compressed_keys, compressed_values, double_compressed_keys, double_compressed_value = compress_func(**kwargs_of_compress_func)
+
+            self.cached_keys = compressed_keys
+            self.cached_values = compressed_values
+
+            return [(torch.cat([sink_keys[i], double_compressed_keys[i]], dim=1), torch.cat([sink_values[i], double_compressed_value[i]], dim=1)) for i in range(self.num_layers)]
+        else:
+            raise NotImplementedError
+
+    def construct_sequence(self, original_sequence, n):
+        k = len(original_sequence)
+        if k == 0:
+            return []
+        
+        # Calculate the base repetition count and the remainder
+        base_count = n // k
+        remainder = n % k
+        
+        # Construct the new sequence
+        new_sequence = []
+        for i in range(k):
+            repetitions = base_count + (1 if i < remainder else 0)
+            new_sequence.extend([original_sequence[i]] * repetitions)
+        
+        return new_sequence
+
+    def llm_forward(self, keys, values, target_len):
+        bsz = keys[0].shape[0]
+        # if target_len > self.query_len:
+        #     mem_token_ids = self.repeat_elements(range(self.query_len), target_len) # repeat mem token id to construct seq of length of target len
+        # else:
+        #     mem_token_ids = range(target_len)
+        mem_token_ids = [0 for _ in range(target_len)]
+        input_ids = torch.tensor(mem_token_ids, device=keys[0].device) + self.memory_token_offset
+        input_ids = input_ids.view(1, -1).expand(bsz, target_len)
+        past_key_values = torch.stack([torch.stack([ck,cv], dim=0) for ck, cv in zip(keys, values)], dim=0)
+        llm_outputs = self.model(input_ids, None, past_key_values=past_key_values)
+        new_keys = [kv[0] for kv in llm_outputs.past_key_values]
+        new_values = [kv[1] for kv in llm_outputs.past_key_values]
+        return new_keys, new_values
+
+    def split_sequence(self, n, k):
+        if k <= 0 or n <= 0:
+            return []
+
+        # 计算完整的长度为k的子序列的数量
+        q = n // k
+        # 计算剩余的长度
+        r = n % k
+
+        # 形成长度为k的子序列
+        subsequences = [k] * q
+
+        # 如果有剩余的长度，则加入长度为r的子序列
+        if r > 0:
+            subsequences.append(r)
+
+        return subsequences
+
+    def repeat_elements(self, original_list, n):
+        k = len(original_list)
+        if k == 0:
+            return []
+
+        # 构建新的长度为n的列表
+        new_list = [original_list[i % k] for i in range(n)]
+        return new_list
+
+    def _compress(self, keys, values, target_len, double_compress=False, **kwargs):
+        # if self.query_len !=0 and target_len > self.query_len:
+        #     pass
+            # sub_target_lens = self.split_sequence(target_len, self.query_len)
+            # cached_keys, cached_values = [], []
+            # for sub_len in sub_target_lens:
+            #     # print(f'before compression: {keys[0].shape}')
+            #     keys, values = self.llm_forward(keys, values, target_len=sub_len)
+            #     # print(f'after compression: {keys[0].shape}')
+            #     cached_keys.append(torch.stack([k[:, -sub_len:] for k in keys], dim=0))
+            #     cached_values.append(torch.stack([v[:, -sub_len:] for v in values], dim=0))
+            # cached_keys = torch.cat(cached_keys, dim=2)
+            # cached_values = torch.cat(cached_values, dim=2)
+            # assert cached_keys.shape[2] == target_len
+            # assert cached_values.shape[2] == target_len
+            # return cached_keys, cached_values
+        # else:
+        new_keys, new_values = self.llm_forward(keys, values, target_len)
+        new_keys = [k[:, -target_len:] for k in new_keys]
+        new_values = [v[:, -target_len:] for v in new_values]
+        if double_compress:
+            double_compressed_keys = [k[:, -self.compressed_chunk_size:] for k in new_keys]
+            double_compressed_values = [v[:, -self.compressed_chunk_size:] for v in new_values]
+            return new_keys, new_values, double_compressed_keys, double_compressed_values
+        else:
+            return new_keys, new_values
+
+    def compress(self, keys, values, attentions, chunk_step):
+        new_key_values = self.read_and_write_memory(self._compress, keys=keys, values=values, attentions=attentions, chunk_step=chunk_step)
+        new_keys, new_values = [kv[0] for kv in new_key_values], [kv[1].detach() for kv in new_key_values]
+        return new_keys, new_values
