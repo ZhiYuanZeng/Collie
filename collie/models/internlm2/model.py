@@ -1090,9 +1090,11 @@ class InternLM2ForCausalLM(CollieModelForCausalLM):
     ):
         # FIXME: 这些transpose会带来更多的显存消耗
         if past_key_values is not None:
-            past_key_values = [
-                (kv[0].transpose(1, 2).contiguous(), kv[1].transpose(1, 2).contiguous()) 
-                    for kv in past_key_values]
+            for i in range(len(past_key_values)): # iterate all layers
+                kv = past_key_values[i]
+                past_key_values[i] = (kv[0].transpose(1, 2).contiguous(), kv[1].transpose(1, 2).contiguous())
+                del kv # free memory
+                
         output = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1101,9 +1103,10 @@ class InternLM2ForCausalLM(CollieModelForCausalLM):
         )
         logits = self.output(output.last_hidden_state)
         if output.past_key_values is not None:
-            output.past_key_values = [
-                (kv[0].transpose(1, 2).contiguous(), kv[1].transpose(1, 2).contiguous()) 
-                    for kv in output.past_key_values]
+            for i in range(len(output.past_key_values)): # iterate all layers
+                kv = output.past_key_values[i]
+                output.past_key_values[i] = (kv[0].transpose(1, 2).contiguous(), kv[1].transpose(1, 2).contiguous())
+                del kv # free memory
         return CausalLMOutputWithPast(
             loss=None,
             logits=logits,
