@@ -1,6 +1,50 @@
-# README
+# AutoCompresser
+将序列划分成多个chunk，并迭代压缩chunk。
+特点：
+- 将LLM和Compresser解耦，因此无需为模型定制Compresser，只要模型输出包含KV Cache，attention scores就能使用本框架
+- 支持多种Compresser，目前经过良好测试的主要是KV Cache Pruner
+- 支持多种Memory管理，例如Chunk_Streaming: 固定memory大小，每次压缩一个chunk都刷新memory
 
-## Availble Memory
+
+## Compresser
+支持的Compressers:
+Pruner: pruner保留一部分kv cache，注意很多kv cache压缩方法需要attention scores，以至于无法使用flash attention。导致压缩后的速度可能反而更慢，显存反而更多。
+
+```python
+class PrunerType:
+    H2O="h2o"
+    STREAMING="streaming_llm"
+    CHUNK_PREFIX="chunk_prefix"
+    TOVA="tova"
+    RANDOM="random"
+    LOCAL_WINDOW="local_window"
+    NO_COMPRESS="no_compress"
+    PERCEIVER="perceiver"
+    ROCO="roco"
+    CONV="conv"
+```
+
+需要attention scores的pruning方法：
+- H2O
+- TOVA
+- ROCO
+- CONV
+
+不需要attention scores的pruning方法：
+- Streaming
+- Chunk_Prefix
+- RANDOM
+- LOCAL_WINDOW
+- NO_COMPRESS
+
+Fuser:
+```python
+class FuserType:
+    PERCEIVER='perceiver'
+    LLM='llm'
+```
+
+## Memory
 支持的memory类型：
 ```python
 class MemoryType:
@@ -9,62 +53,16 @@ class MemoryType:
     DYNAMIC_INCREMENTAL="Incremental_Chunk_Streaming_Dynamic_History" # Incremental Dynamic Memory
     DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS="dynamic_incremental_double_compress" # Incremental Dynamic Memory with Double Compression
 ```
-## Available Compresser
-支持的Compressers:
 
-Pruner:
-```python
-class AutoPruner:
-    @staticmethod
-    def from_pretrained(pruner_type, pretrained_model_name_or_path, config, perceiver_path=None):
-        if pruner_type == PrunerType.H2O:
-            config.use_flash = False
-            print('Warning: the h2o pruner requires attention scores, therefore the flash_attention is set to False!')
-            pruner = H2oPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == PrunerType.STREAMING:
-            pruner = StreamingLMPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == PrunerType.CHUNK_PREFIX:
-            pruner = ChunkPrefix.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == PrunerType.TOVA:
-            config.use_flash = False
-            print('Warning: the h2o pruner requires attention scores, therefore the flash_attention is set to False!')
-            pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == PrunerType.RANDOM:
-            pruner = RandomPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == PrunerType.LOCAL_WINDOW: # remove context
-            config.mem_perceiver_config['compressed_chunk_size'] = 0
-            pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == PrunerType.NO_COMPRESS:
-            pruner = build_llm_from_name_or_path(pretrained_model_name_or_path, config) # no compress
-        # parameters required
-        elif pruner_type == PrunerType.PERCEIVER:
-            pruner = PerceiverPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        else:
-            raise NotImplementedError
-        if pruner_type in (PrunerType.H2O):
-            assert config.mem_perceiver_config['memory_type'] in (MemoryType.CHUNK_STREAMING, MemoryType.DYNAMIC_INCREMENTAL)
-
-        return pruner
-```
-
-Fuser:
-```python
-class AutoFuser:
-    @staticmethod
-    def from_pretrained(fuser_type, pretrained_model_name_or_path, config, perceiver_path):
-        if fuser_type == 'perceiver':
-            fuser = SparseFuserPerceiver.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif fuser_type == 'llm':
-            fuser = LLMFuser.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        else:
-            raise NotImplementedError
-        return fuser
-```
+- CHUNK_STREAMING: 固定memory大小，每次压缩新的chunk更新Memory
+- FIXED_INCREMENTAL: 每次压缩新的chunk会在原有memory的基础上拼接
+- DYNAMIC_INCREMENTAL: 每次压缩新的chunk，会刷新memory，并且增加memory size
+- DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS: 每次压缩新的chunk，会刷新memory，并且增加memory size，但是还会对memory再做一次压缩，第二次压缩的结果会输入LLM
 
 ## Usage
 参考
-- `tests/models/mem_perceiver/test_decoding.py`
-- `tests/models/mem_perceiver/test_llm_fuser.py`
+- pruner: `tests/models/mem_perceiver/test_decoding.py`
+- fuser: `tests/models/mem_perceiver/test_llm_fuser.py`
 ```python
 # 创建collie config
 config = CollieConfig.from_pretrained(llm_name_or_path,
@@ -73,17 +71,18 @@ config.checkpointing = True
 config.use_flash = True
 # 创建compresser config
 mem_perceiver_config = {
-    # llm config
+    # llm config，从llm config获取
     "d_model": d_model,
     "num_heads": num_heads,
     "num_layers": num_layers,
-    # custom config
-    "memory_type": MemoryType.DYNAMIC_INCREMENTAL,
-    "query_len": compressed_chunk_size,
-    "compressed_chunk_size": compressed_chunk_size,
-    "d_query": d_query,
-    "chunk_size": chunk_size,
-    "num_sink_tokens": 4,
+
+    # custom config，需要自定义的参数
+    "memory_type": MemoryType.DYNAMIC_INCREMENTAL, # 选择哪种memory
+    "chunk_size": chunk_size, # 滚动压缩的chunk size
+    "compressed_chunk_size": compressed_chunk_size, # 每个chunk压缩后的长度 
+    "query_len": compressed_chunk_size, # 只有perceiver需要这个参数
+    "d_query": d_query, # 只有perceiver需要这个参数，应该设置的小一点
+    "num_sink_tokens": 4, # sink token的数量，参考streaming llm
 }
 # 调用AutoXXX.from_pretrained
 mem_perceiver = AutoPruner.from_pretrained(
@@ -100,6 +99,9 @@ mem_perceiver.generate(...)
 
 训练perceiver-fuser:
 `bash examples/mem_perceiver/finetune_sparse_fuser.sh`
+
+训练llm-fuser:
+`bash examples/mem_perceiver/finetune_llm_fuser.sh`
 
 评测tova的ppl:
 `bash examples/mem_perceiver/finetune_tova_pruner.sh`
