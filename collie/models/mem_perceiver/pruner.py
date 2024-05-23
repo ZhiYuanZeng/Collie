@@ -35,6 +35,8 @@ class PrunerType:
     LOCAL_WINDOW="local_window"
     NO_COMPRESS="no_compress"
     PERCEIVER="perceiver"
+    ROCO="roco"
+    CONV="conv"
 
 def build_llm_from_name_or_path(model_name_or_path, config):
     if 'llama' in model_name_or_path.lower():
@@ -56,8 +58,6 @@ class AutoPruner:
             pruner = StreamingLMPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         elif pruner_type == PrunerType.CHUNK_PREFIX:
             pruner = ChunkPrefix.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        # elif pruner_type == PrunerType.CHUNK_POSTFIX:
-        #     pruner = ChunkPostfix.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         elif pruner_type == PrunerType.TOVA:
             config.use_flash = False
             print('Warning: the h2o pruner requires attention scores, therefore the flash_attention is set to False!')
@@ -69,6 +69,12 @@ class AutoPruner:
             pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         elif pruner_type == PrunerType.NO_COMPRESS:
             pruner = build_llm_from_name_or_path(pretrained_model_name_or_path, config) # no compress
+        elif pruner_type == PrunerType.ROCO:
+            config.use_flash = False
+            pruner = ROCOPruner.from_pretrained(pretrained_model_name_or_path, config)
+        elif pruner_type == PrunerType.CONV:
+            config.use_flash = False
+            pruner = ConvPruner.from_pretrained(pretrained_model_name_or_path, config)
         # parameters required
         elif pruner_type == PrunerType.PERCEIVER:
             pruner = PerceiverPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
@@ -470,29 +476,14 @@ class H2oPruner(TovaPruner):
         self.accum_attention_scores = [None for i in range(self.num_layers)]
 
 class StreamingLMPruner(TovaPruner):
-    def get_indices(self, attention, attention_shape):
+    def get_indices(self, attention, attention_shape, target_len, *args, **kwargs):
         # indices shape: (bsz, num_heads, target_len)
-        bsz, num_heads = attention_shape[0], attention_shape[1]
-        indices = torch.arange(self.num_sink_tokens)
-        return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, self.num_sink_tokens)
-    
-    def compress(self, keys, values, attentions, **kwargs):
-        keeped_keys = []
-        keeped_values = []
-        bsz, seq_len, num_heads, head_dim = keys[0].shape
-        for key, value, attention in zip(keys, values, attentions):
-            attention_shape = (bsz, num_heads, seq_len, seq_len)
-            topk_indices = self.get_indices(attention, attention_shape).to(key.device)
-            topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, self.num_sink_tokens, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
-            topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
-
-            selected_keys = torch.gather(key, index=topk_indices, dim=1)
-            selected_values = torch.gather(value, index=topk_indices, dim=1)
-
-            assert selected_keys.shape == (bsz, self.num_sink_tokens, num_heads, head_dim)
-            keeped_keys.append(selected_keys)
-            keeped_values.append(selected_values)
-        return keeped_keys, keeped_values
+        bsz, num_heads, seq_len = attention_shape[0], attention_shape[1], attention_shape[-1]
+        indices = torch.arange(seq_len)[-target_len:]
+        double_compressed_indices = indices[-self.compressed_chunk_size:]
+        indices = indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
+        double_compressed_indices = double_compressed_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, self.compressed_chunk_size)
+        return indices, double_compressed_indices, None
 
 class RandomPruner(TovaPruner):
     # sink tokens + random tokens
@@ -511,14 +502,78 @@ class ChunkPrefix(TovaPruner):
         indices = torch.arange(target_len)
         return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
 
-class ChunkPostfix(TovaPruner):
-    # keep the first k tokens for each chunk
-    def get_indices(self, attention, attention_shape, target_len):
-        # indices shape: (bsz, num_heads, target_len)
-        bsz, num_heads, seq_len = attention_shape[0], attention_shape[1], attention_shape[-1]
-        indices = torch.arange(target_len) + (seq_len - target_len)
-        return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
+class ConvPruner(TovaPruner):
+    def __init__(self, config, chunk_size, compressed_chunk_size=0, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, kernel_size=5, **kwargs):
+        super().__init__(config, chunk_size, compressed_chunk_size, model, num_sink_tokens, num_layers, memory_type)
+        self.kernel_size = kernel_size
+        assert kernel_size % 2 != 0
 
+    def get_indices(self, attention, attention_shape, target_len, cached_attention=None):
+        assert attention is not None
+        chunk_size = min(self.chunk_size, attention.shape[-1])
+        new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
+        accum_attention_scores = new_attention_scores.sum(dim = 2) # (bsz, num_heads, seq_len)
+        
+        accum_attention_scores = nn.functional.avg_pool1d(accum_attention_scores, kernel_size=self.kernel_size, stride=1, padding=self.kernel_size // 2)
+        assert accum_attention_scores.shape[-1] == attention_shape[-1], f'{accum_attention_scores.shape=}, {attention_shape=}'
+        
+        normalization_scores = torch.ones(attention.shape[-1], device=attention.device) * chunk_size
+        normalization_scores[-chunk_size:] = chunk_size - torch.arange(chunk_size, device=attention.device)
+        # print(normalization_scores)
+        important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
+        if cached_attention is not None:
+            # the cached attention is for incremental fixed memory
+            # print(self.cached_attentions[layer_idx].shape, attention.shape)
+            important_scores = torch.cat([cached_attention, important_scores], dim=-1)
+
+        important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
+        double_compressed_indices = important_indices[:, :, :self.compressed_chunk_size]
+
+        important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
+        double_compressed_indices, _ = torch.sort(double_compressed_indices, dim=-1) # 方便位置编码
+
+        selected_attention = torch.gather(important_scores, index=important_indices, dim=-1)
+        cached_attention = selected_attention
+        return important_indices, double_compressed_indices, cached_attention
+
+class ROCOPruner(TovaPruner):
+    def get_indices(self, attention, attention_shape, target_len, cached_attention=None):
+        assert attention is not None
+        chunk_size = min(self.chunk_size, attention.shape[-1])
+        new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
+        accum_attention_scores = new_attention_scores.sum(dim = 2) # (bsz, num_heads, seq_len)
+        assert accum_attention_scores.shape[-1] == attention_shape[-1]
+        
+        normalization_scores = torch.ones(attention.shape[-1], device=attention.device) * chunk_size
+        normalization_scores[-chunk_size:] = chunk_size - torch.arange(chunk_size, device=attention.device)
+        # print(normalization_scores)
+        important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
+        # v(x)=e(x^2)-e(x)^2
+        std_scores = torch.sqrt(torch.sum(new_attention_scores**2) / normalization_scores - important_scores**2)
+        _, std_removed_indices = torch.topk(std_scores, k=self.compressed_chunk_size // 2, dim=-1, largest=False)
+        
+        mask_for_important_scores = torch.zeros_like(important_scores).bool()
+        assert not torch.any(mask_for_important_scores)
+        important_scores = torch.scatter(
+            important_scores, 
+            dim=-1, 
+            index=std_removed_indices, 
+            src=torch.zeros_like(std_removed_indices).type_as(important_scores)) # mask the kv with low variance
+
+        if cached_attention is not None:
+            # the cached attention is for incremental fixed memory
+            # print(self.cached_attentions[layer_idx].shape, attention.shape)
+            important_scores = torch.cat([cached_attention, important_scores], dim=-1)
+
+        important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
+        double_compressed_indices = important_indices[:, :, :self.compressed_chunk_size]
+
+        important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
+        double_compressed_indices, _ = torch.sort(double_compressed_indices, dim=-1) # 方便位置编码
+
+        selected_attention = torch.gather(important_scores, index=important_indices, dim=-1)
+        cached_attention = selected_attention
+        return important_indices, double_compressed_indices, cached_attention
 
 class PerceiverPrunerLayer(nn.Module):
     def __init__(self, query_len, compressed_chunk_size, d_query, d_model, chunk_size, temperature) -> None:
