@@ -256,51 +256,6 @@ class TovaPruner(CollieModelForCausalLM):
             self.cached_values[layer_idx] = compressed_value
 
             return torch.cat([sink_key, double_compressed_keys], dim=1), torch.cat([sink_value, double_compressed_value], dim=1)
-
-        elif self.memory_type == MemoryType.RETRIEVE_ALL_KV:
-            # 和inf-llm类似，保留所有kv cache,并检索
-            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size
-            cached_key = self.cached_keys[layer_idx]
-            cached_value = self.cached_values[layer_idx]
-            if cached_key is not None:
-                kwargs_of_compress_func['key'] = cached_key
-                kwargs_of_compress_func['value'] = cached_value
-            # retrive
-            compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
-            # cache all kv cache
-            if cached_key is None:
-                self.cached_keys[layer_idx] = key
-                self.cached_values[layer_idx] = value
-            else:
-                self.cached_keys[layer_idx] = torch.cat([cached_key, key], dim=1)
-                self.cached_values[layer_idx] = torch.cat([cached_value, value], dim=1)
-            return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
-
-        elif self.memory_type == MemoryType.RETRIEVE_INCREMENTAL:
-            # 保留所有压缩后的kv cache,并检索
-            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size
-            # remove the retrieved kv
-            key = key[:, -self.chunk_size:]
-            value = value[:, -self.chunk_size:]
-            if kwargs_of_compress_func['attention'] is not None:
-                kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:, :, :, -self.chunk_size:]
-
-            cached_key = self.cached_keys[layer_idx]
-            cached_value = self.cached_values[layer_idx]
-
-            if cached_key is not None:
-                kwargs_of_compress_func['key'] = torch.cat([cached_key, kwargs_of_compress_func['key']], dim=1)
-                kwargs_of_compress_func['value'] = torch.cat([cached_value, kwargs_of_compress_func['value']], dim=1)
-            compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
-
-            if cached_key is None:
-                self.cached_keys[layer_idx] = compressed_key
-                self.cached_values[layer_idx] = compressed_value
-            else:
-                self.cached_keys[layer_idx] = torch.cat([cached_key, compressed_key], dim=1)
-                self.cached_values[layer_idx] = torch.cat([cached_value, compressed_value], dim=1)
-            return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
-
         else:
             raise NotImplementedError
 
