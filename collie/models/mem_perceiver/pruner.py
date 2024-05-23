@@ -236,15 +236,15 @@ class TovaPruner(CollieModelForCausalLM):
         
         elif self.memory_type == MemoryType.DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS:
             # 只保留新的chunk的kv,否则memory中会存在很多重复元素
-            kwargs_of_compress_func['key'] = key[:, self.compressed_chunk_size:]
-            kwargs_of_compress_func['value'] = value[:, self.compressed_chunk_size:]
-            if kwargs_of_compress_func['attention'] is not None:
-                kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:, :, :, self.compressed_chunk_size:]
-
             cached_key = self.cached_keys[layer_idx]
             cached_value = self.cached_values[layer_idx]
 
             if cached_key is not None:
+                kwargs_of_compress_func['key'] = key[:, self.compressed_chunk_size:]
+                kwargs_of_compress_func['value'] = value[:, self.compressed_chunk_size:]
+                if kwargs_of_compress_func['attention'] is not None:
+                    kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:, :, :, self.compressed_chunk_size:]
+
                 kwargs_of_compress_func['key'] = torch.cat([cached_key, kwargs_of_compress_func['key']], dim=1)
                 kwargs_of_compress_func['value'] = torch.cat([cached_value, kwargs_of_compress_func['value']], dim=1)
 
