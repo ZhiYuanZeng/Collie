@@ -50,11 +50,7 @@ def build_llm_from_name_or_path(model_name_or_path, config):
 class AutoPruner:
     @staticmethod
     def from_pretrained(pruner_type, pretrained_model_name_or_path, config, perceiver_path=None):
-        if pruner_type == PrunerType.H2O:
-            config.use_flash = False
-            print('Warning: the h2o pruner requires attention scores, therefore the flash_attention is set to False!')
-            pruner = H2oPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
-        elif pruner_type == PrunerType.STREAMING:
+        if pruner_type == PrunerType.STREAMING:
             pruner = StreamingLMPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         elif pruner_type == PrunerType.CHUNK_PREFIX:
             pruner = ChunkPrefix.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
@@ -386,50 +382,6 @@ class TovaPruner(CollieModelForCausalLM):
         else:
             mem_perceiver = cls.from_config(config=config, model=model)
         return mem_perceiver
-
-class H2oPruner(TovaPruner):
-    def __init__(self, config, num_layers=0, **kwargs):
-        super().__init__(config, num_layers=num_layers, **kwargs)
-        self.accum_attention_scores = [None for i in range(num_layers)]
-
-    def get_indices(self, attention, attention_shape,  target_len, layer_idx):
-        # attention: [bsz, num_heads, key_len, key_len]
-        # key: [bsz, seq_len, num_heads, head_dim]
-        assert attention is not None
-        new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
-        accum_attention_scores = new_attention_scores.sum(dim = 2) # (bsz, num_heads, seq_len)
-
-        cached_accum_scores = self.accum_attention_scores[layer_idx]
-        if cached_accum_scores is not None:
-            # assert accum_attention_scores.shape[-1] == cached_accum_scores.shape[-1] + self.chunk_size, f'{attention.shape}, {accum_attention_scores.shape[-1]=}, {cached_accum_scores.shape[-1]=} {self.chunk_size=}'
-            accum_attention_scores[:, :, :cached_accum_scores.shape[-1]] += cached_accum_scores
-
-        # print(normalization_scores)
-        important_indices = torch.topk(accum_attention_scores, dim=-1, k=target_len).indices
-        important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
-        self.accum_attention_scores[layer_idx] = torch.gather(accum_attention_scores, dim=2, index=important_indices)
-        return important_indices
-
-    def compress_layer(self, key, value, attention, target_len, layer_idx):
-        bsz, seq_len, num_heads, head_dim = key.shape
-        if attention is None:
-            attention_shape = (bsz, num_heads, seq_len, seq_len)
-        else:
-            attention_shape = attention.shape
-        topk_indices = self.get_indices(attention, attention_shape, target_len, layer_idx).to(key.device)
-        topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
-        topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
-
-        selected_keys = torch.gather(key, index=topk_indices, dim=1)
-        selected_values = torch.gather(value, index=topk_indices, dim=1)
-
-        assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
-
-        return selected_keys, selected_values
-    
-    def clear_perceiver_cache(self):
-        super().clear_perceiver_cache()
-        self.accum_attention_scores = [None for i in range(self.num_layers)]
 
 class StreamingLMPruner(TovaPruner):
     def get_indices(self, attention, attention_shape, target_len, *args, **kwargs):
