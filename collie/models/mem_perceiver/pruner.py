@@ -229,29 +229,6 @@ class TovaPruner(CollieModelForCausalLM):
             kwargs_of_compress_func['target_len'] = self.compressed_chunk_size * (chunk_step + 1) # incremental memory size
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
             return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
-        
-        elif self.memory_type == MemoryType.DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS:
-            # 只保留新的chunk的kv,否则memory中会存在很多重复元素
-            cached_key = self.cached_keys[layer_idx]
-            cached_value = self.cached_values[layer_idx]
-
-            if cached_key is not None:
-                kwargs_of_compress_func['key'] = key[:, self.compressed_chunk_size:]
-                kwargs_of_compress_func['value'] = value[:, self.compressed_chunk_size:]
-                if kwargs_of_compress_func['attention'] is not None:
-                    kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:, :, :, self.compressed_chunk_size:]
-
-                kwargs_of_compress_func['key'] = torch.cat([cached_key, kwargs_of_compress_func['key']], dim=1)
-                kwargs_of_compress_func['value'] = torch.cat([cached_value, kwargs_of_compress_func['value']], dim=1)
-
-            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size * (chunk_step + 1) # incremental memory size
-            kwargs_of_compress_func['double_compress'] = True
-            compressed_key, compressed_value, double_compressed_keys, double_compressed_value = compress_func(**kwargs_of_compress_func)
-
-            self.cached_keys[layer_idx] = compressed_key
-            self.cached_values[layer_idx] = compressed_value
-
-            return torch.cat([sink_key, double_compressed_keys], dim=1), torch.cat([sink_value, double_compressed_value], dim=1)
         else:
             raise NotImplementedError
 
@@ -388,10 +365,8 @@ class StreamingLMPruner(TovaPruner):
         # indices shape: (bsz, num_heads, target_len)
         bsz, num_heads, seq_len = attention_shape[0], attention_shape[1], attention_shape[-1]
         indices = torch.arange(seq_len)[-target_len:]
-        double_compressed_indices = indices[-self.compressed_chunk_size:]
         indices = indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
-        double_compressed_indices = double_compressed_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, self.compressed_chunk_size)
-        return indices, double_compressed_indices, None
+        return indices, None
 
 class RandomPruner(TovaPruner):
     # sink tokens + random tokens
@@ -401,8 +376,7 @@ class RandomPruner(TovaPruner):
         sample_indices = random.sample(range(seq_len), target_len)
         token_indices = torch.arange(seq_len)[sample_indices]
         token_indices = token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
-        double_compressed_indices = token_indices[:, :, :self.compressed_chunk_size]
-        return token_indices, double_compressed_indices, None
+        return token_indices, None
 
 class ChunkPrefix(TovaPruner):
     def get_indices(self, attention, attention_shape, target_len):
@@ -412,7 +386,7 @@ class ChunkPrefix(TovaPruner):
 
 class ConvPruner(TovaPruner):
     def __init__(self, config, chunk_size, compressed_chunk_size=0, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, kernel_size=5, **kwargs):
-        super().__init__(config, chunk_size, compressed_chunk_size, model, num_sink_tokens, num_layers, memory_type)
+        super().__init__(config, chunk_size, compressed_chunk_size, model, num_sink_tokens, num_layers, memory_type, **kwargs)
         self.kernel_size = kernel_size
         assert kernel_size % 2 != 0
 
@@ -427,7 +401,6 @@ class ConvPruner(TovaPruner):
         
         normalization_scores = torch.ones(attention.shape[-1], device=attention.device) * chunk_size
         normalization_scores[-chunk_size:] = chunk_size - torch.arange(chunk_size, device=attention.device)
-        # print(normalization_scores)
         important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
         if cached_attention is not None:
             # the cached attention is for incremental fixed memory
@@ -435,14 +408,11 @@ class ConvPruner(TovaPruner):
             important_scores = torch.cat([cached_attention, important_scores], dim=-1)
 
         important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
-        double_compressed_indices = important_indices[:, :, :self.compressed_chunk_size]
-
         important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
-        double_compressed_indices, _ = torch.sort(double_compressed_indices, dim=-1) # 方便位置编码
 
         selected_attention = torch.gather(important_scores, index=important_indices, dim=-1)
         cached_attention = selected_attention
-        return important_indices, double_compressed_indices, cached_attention
+        return important_indices, cached_attention
 
 class ROCOPruner(TovaPruner):
     def get_indices(self, attention, attention_shape, target_len, cached_attention=None):
@@ -474,14 +444,12 @@ class ROCOPruner(TovaPruner):
             important_scores = torch.cat([cached_attention, important_scores], dim=-1)
 
         important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
-        double_compressed_indices = important_indices[:, :, :self.compressed_chunk_size]
 
         important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
-        double_compressed_indices, _ = torch.sort(double_compressed_indices, dim=-1) # 方便位置编码
 
         selected_attention = torch.gather(important_scores, index=important_indices, dim=-1)
         cached_attention = selected_attention
-        return important_indices, double_compressed_indices, cached_attention
+        return important_indices, cached_attention
 
 class PerceiverPrunerLayer(nn.Module):
     def __init__(self, query_len, compressed_chunk_size, d_query, d_model, chunk_size, temperature) -> None:
