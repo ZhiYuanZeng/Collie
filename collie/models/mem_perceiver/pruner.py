@@ -82,7 +82,7 @@ class AutoPruner:
         return pruner
 
 class TovaPruner(CollieModelForCausalLM):
-    def __init__(self, config, chunk_size, compressed_chunk_size=0, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, **kwargs):
+    def __init__(self, config, chunk_size, compressed_chunk_size=0, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, separate_compress=False, memory_size_limit=None, **kwargs):
         super().__init__(config)
         self.model = model
         self.chunk_size = chunk_size
@@ -96,7 +96,8 @@ class TovaPruner(CollieModelForCausalLM):
         self.cached_keys = [None for _ in range(num_layers)]
         self.cached_values = [None for _ in range(num_layers)]
         self.cached_attentions = [None for _ in range(num_layers)]
-    
+        self.memory_size_limit = memory_size_limit
+
     def frozen_model(self):
         for p in self.model.parameters():
             p.requires_grad = False
@@ -195,6 +196,9 @@ class TovaPruner(CollieModelForCausalLM):
             # 类似AutoCompresser, 压缩后的kv cache都缓存下来, 且都被读取
             incremental_key = key[:, :-self.chunk_size]
             incremental_value = value[:, :-self.chunk_size]
+            if self.memory_size_limit is not None and incremental_key.shape[1] >= self.memory_size_limit:
+                return torch.cat([sink_key, incremental_key]), torch.cat([sink_value, incremental_value])
+            
             kwargs_of_compress_func['key'] = key[:, -self.chunk_size:]
             kwargs_of_compress_func['value'] = value[:, -self.chunk_size:]
             if kwargs_of_compress_func['attention'] is not None:
@@ -206,8 +210,13 @@ class TovaPruner(CollieModelForCausalLM):
         
         elif self.memory_type == MemoryType.DYNAMIC_INCREMENTAL:
             # memory在随着chunk数量的增加而变长，但是每次增长会刷新整个memory，而incremental memory只会在之前的基础上拼接新的memory
-            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size * (chunk_step + 1) # incremental memory size
+            if self.memory_size_limit is not None:
+                kwargs_of_compress_func['target_len'] = min(self.compressed_chunk_size * (chunk_step + 1), self.memory_size_limit)
+            else:
+                kwargs_of_compress_func['target_len'] = self.compressed_chunk_size * (chunk_step + 1) # incremental memory size
+
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
+                        
             return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
         else:
             raise NotImplementedError
