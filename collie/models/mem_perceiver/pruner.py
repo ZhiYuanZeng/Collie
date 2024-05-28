@@ -283,9 +283,16 @@ class TovaPruner(CollieModelForCausalLM):
             # print("incremental decoding...", flush=True)
             # incremental decoding
             assert past_key_values is not None
+            use_flash = self.collie_config.use_flash
+            for layer in self.model.model.layers:
+                layer.config.use_flash = True # force to use flash attention at decoding
+
             # print(f'{input_ids.shape=}, {attention_mask.shape=}, {past_key_values[0].shape=}')
             # the compressed kv cache should all be attened, so the attention_mask should be None
-            return self.model(input_ids, None, past_key_values=past_key_values)
+            model_outputs = self.model(input_ids, None, past_key_values=past_key_values)
+            for layer in self.model.model.layers:
+                layer.config.use_flash = use_flash # force to use flash attention at decoding
+            return model_outputs
         
     def set_cache(self, use_cache):
         return self.model.set_cache(use_cache)
