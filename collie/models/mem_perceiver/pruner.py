@@ -110,7 +110,8 @@ class TovaPruner(CollieModelForCausalLM):
         mem_perceiver.frozen_model()
         return mem_perceiver
 
-    def get_indices(self, attention, attention_shape, target_len, cached_attention=None):
+
+    def get_indices(self, attention, attention_shape, target_len):
         assert attention is not None
         chunk_size = min(self.chunk_size, attention.shape[-1])
         new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
@@ -120,22 +121,16 @@ class TovaPruner(CollieModelForCausalLM):
         normalization_scores[-chunk_size:] = chunk_size - torch.arange(chunk_size, device=attention.device)
         # print(normalization_scores)
         important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
-        if cached_attention is not None:
-            # the cached attention is for incremental fixed memory
-            # print(self.cached_attentions[layer_idx].shape, attention.shape)
-            important_scores = torch.cat([cached_attention, important_scores], dim=-1)
 
         important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
-        double_compressed_indices = important_indices[:, :, :self.compressed_chunk_size]
-
         important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
-        double_compressed_indices, _ = torch.sort(double_compressed_indices, dim=-1) # 方便位置编码
+        # print(self.move_avg('memory_ratio',
+        #     torch.sum(important_indices < self.compressed_chunk_size).item() / torch.numel(important_indices)
+        # ))
+        
+        return important_indices
 
-        selected_attention = torch.gather(important_scores, index=important_indices, dim=-1)
-        cached_attention = selected_attention
-        return important_indices, double_compressed_indices, cached_attention
-
-    def compress_layer(self, key, value, attention, target_len, layer_idx, double_compress=False):
+    def compress_layer(self, key, value, attention, target_len):
         bsz, seq_len, num_heads, head_dim = key.shape
         if attention is None:
             attention_shape = (bsz, num_heads, seq_len, seq_len)
@@ -149,16 +144,9 @@ class TovaPruner(CollieModelForCausalLM):
             attention = attention.sum(dim=1)
             assert attention.shape[1] == num_heads
         
-        if attention_shape[-1] != seq_len:
-            cached_attention = self.cached_attentions[layer_idx]
-        else:
-            cached_attention = None
-        topk_indices, double_compressed_indices, cached_attention = self.get_indices(attention, attention_shape, target_len, cached_attention)
+        topk_indices = self.get_indices(attention, attention_shape, target_len)
         topk_indices = topk_indices.to(key.device)
-        double_compressed_indices = double_compressed_indices.to(key.device)
-
-        self.cached_attentions[layer_idx] = cached_attention
-
+        # self.record_indices(topk_indices.view(-1) + chunk_step * self.chunk_size)
         topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
         topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
 
@@ -166,15 +154,7 @@ class TovaPruner(CollieModelForCausalLM):
         selected_values = torch.gather(value, index=topk_indices, dim=1)
         assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
 
-        if double_compress:
-            double_compressed_indices = double_compressed_indices.unsqueeze(dim=-1).expand(bsz, num_heads, self.compressed_chunk_size, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
-            double_compressed_indices = double_compressed_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
-
-            double_compressed_keys = torch.gather(key, index=double_compressed_indices, dim=1)
-            double_compressed_values = torch.gather(value, index=double_compressed_indices, dim=1)
-            return selected_keys, selected_values, double_compressed_keys, double_compressed_values
-        else:
-            return selected_keys, selected_values
+        return selected_keys, selected_values
 
     def compress(self, keys, values, attentions, chunk_step):
         keeped_keys = []
@@ -182,7 +162,7 @@ class TovaPruner(CollieModelForCausalLM):
         for i, (key, value, attention) in enumerate(zip(keys, values, attentions)):
             selected_keys, selected_values = self.read_and_write_memory(
                 self.compress_layer,
-                key=key, value=value, attention=attention, chunk_step=chunk_step, layer_idx=i)
+                key=key, value=value, attention=attention, chunk_step=chunk_step)
             keeped_keys.append(selected_keys)
             keeped_values.append(selected_values)
         # print(f'before compression, key shape: {keys[0].shape}, value shape: {values[0].shape}, attention shape: {attentions[0].shape}')
@@ -366,7 +346,7 @@ class StreamingLMPruner(TovaPruner):
         bsz, num_heads, seq_len = attention_shape[0], attention_shape[1], attention_shape[-1]
         indices = torch.arange(seq_len)[-target_len:]
         indices = indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
-        return indices, None
+        return indices
 
 class RandomPruner(TovaPruner):
     # sink tokens + random tokens
@@ -376,7 +356,7 @@ class RandomPruner(TovaPruner):
         sample_indices = random.sample(range(seq_len), target_len)
         token_indices = torch.arange(seq_len)[sample_indices]
         token_indices = token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
-        return token_indices, None
+        return token_indices
 
 class ChunkPrefix(TovaPruner):
     def get_indices(self, attention, attention_shape, target_len):
@@ -390,7 +370,7 @@ class ConvPruner(TovaPruner):
         self.kernel_size = kernel_size
         assert kernel_size % 2 != 0
 
-    def get_indices(self, attention, attention_shape, target_len, cached_attention=None):
+    def get_indices(self, attention, attention_shape, target_len):
         assert attention is not None
         chunk_size = min(self.chunk_size, attention.shape[-1])
         new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
@@ -402,20 +382,14 @@ class ConvPruner(TovaPruner):
         normalization_scores = torch.ones(attention.shape[-1], device=attention.device) * chunk_size
         normalization_scores[-chunk_size:] = chunk_size - torch.arange(chunk_size, device=attention.device)
         important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
-        if cached_attention is not None:
-            # the cached attention is for incremental fixed memory
-            # print(self.cached_attentions[layer_idx].shape, attention.shape)
-            important_scores = torch.cat([cached_attention, important_scores], dim=-1)
 
         important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
         important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
 
-        selected_attention = torch.gather(important_scores, index=important_indices, dim=-1)
-        cached_attention = selected_attention
-        return important_indices, cached_attention
+        return important_indices
 
 class ROCOPruner(TovaPruner):
-    def get_indices(self, attention, attention_shape, target_len, cached_attention=None):
+    def get_indices(self, attention, attention_shape, target_len):
         assert attention is not None
         chunk_size = min(self.chunk_size, attention.shape[-1])
         new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
@@ -438,18 +412,11 @@ class ROCOPruner(TovaPruner):
             index=std_removed_indices, 
             src=torch.zeros_like(std_removed_indices).type_as(important_scores)) # mask the kv with low variance
 
-        if cached_attention is not None:
-            # the cached attention is for incremental fixed memory
-            # print(self.cached_attentions[layer_idx].shape, attention.shape)
-            important_scores = torch.cat([cached_attention, important_scores], dim=-1)
-
         important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
 
         important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
 
-        selected_attention = torch.gather(important_scores, index=important_indices, dim=-1)
-        cached_attention = selected_attention
-        return important_indices, cached_attention
+        return important_indices
 
 class PerceiverPrunerLayer(nn.Module):
     def __init__(self, query_len, compressed_chunk_size, d_query, d_model, chunk_size, temperature) -> None:
