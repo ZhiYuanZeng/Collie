@@ -131,7 +131,37 @@ class TovaPruner(CollieModelForCausalLM):
         
         return important_indices
 
-    def compress_layer(self, key, value, attention, target_len):
+    def update_cached_indices(self, seq_len, topk_indices, chunk_step, layer_idx):
+        bsz, num_heads, _ = topk_indices.shape
+        if self.cached_indices[layer_idx] is not None:
+            if self.memory_type == MemoryType.FIXED_INCREMENTAL:
+                assert seq_len <= self.chunk_size
+                new_chunk_size = seq_len
+                global_indices = self.chunk_size * chunk_step + \
+                    torch.arange(new_chunk_size, device=topk_indices.device).view(1,1,new_chunk_size).expand(bsz, num_heads, new_chunk_size)
+            else:
+                new_chunk_size = seq_len - self.cached_indices[layer_idx].shape[-1]
+                new_chunk_indices = self.chunk_size * chunk_step + \
+                    torch.arange(new_chunk_size, device=topk_indices.device).view(1,1,new_chunk_size).expand(bsz, num_heads, new_chunk_size)
+                global_indices = torch.cat([self.cached_indices[layer_idx], new_chunk_indices], dim=-1)
+                # if layer_idx == 0:
+                #     print(self.cached_indices[layer_idx][0,0][:(seq_len-new_chunk_size)])
+
+        else:
+            new_chunk_indices = self.num_sink_tokens + torch.arange(seq_len, device=topk_indices.device).view(1,1,seq_len).expand(bsz, num_heads, seq_len)
+            global_indices = new_chunk_indices
+        assert global_indices.shape[-1] == seq_len
+
+        if self.memory_type == MemoryType.FIXED_INCREMENTAL:
+            if self.cached_indices[layer_idx] is None:
+                self.cached_indices[layer_idx] = torch.gather(global_indices, dim=-1, index=topk_indices)
+            else:
+                self.cached_indices[layer_idx] = torch.cat(
+                    [self.cached_indices[layer_idx], torch.gather(global_indices, dim=-1, index=topk_indices)], dim=-1
+                )
+        else:
+            self.cached_indices[layer_idx] = torch.gather(global_indices, dim=-1, index=topk_indices)
+
         bsz, seq_len, num_heads, head_dim = key.shape
         if attention is None:
             attention_shape = (bsz, num_heads, seq_len, seq_len)
