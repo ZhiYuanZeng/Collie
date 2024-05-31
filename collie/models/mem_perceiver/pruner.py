@@ -401,17 +401,13 @@ class TovaPruner(CollieModelForCausalLM):
             do compress
         """
         seq_len = input_ids.shape[1]
-        elif self.memory_type == MemoryType.DualMemory:
-            assert kwargs_of_compress_func['attention'] is not None
-            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size # the compressed memory size is constant
-            global_memory_size = int(kwargs_of_compress_func['target_len'] * 0.05)
-            if self.cached_frequences[layer_idx] is not None:
-                global_memory_freqs, global_memory_indices = torch.topk(self.cached_frequences[layer_idx], dim=-1, k=global_memory_size)
-                global_memory_freqs -= 0.5
-                self.cached_frequences[layer_idx] = self.cached_frequences[layer_idx].scatter(index=global_memory_indices, dim=-1, src=global_memory_freqs)
-                kwargs_of_compress_func['survive_indices'] = global_memory_indices
-            # count the frequence of the memory unit and keep the most frequent memory into long-term memory, which is not involved into pruning 
+        if seq_len > 1:
+            if self.compress_ratio is not None and self.memory_type == MemoryType.CHUNK_STREAMING:
+                self.compressed_chunk_size = int(seq_len * self.compress_ratio)
+            chunked_input_ids = torch.split(input_ids, self.chunk_size, dim=1) # TODO: 支持长度无法被均分的情况
+            self.num_steps = len(chunked_input_ids)
             # chunked_attention_mask = torch.split(attention_mask, self.chunk_size, dim=1)
+            num_chunks = len(chunked_input_ids)
             
             cached_llm_outpus = []
 
