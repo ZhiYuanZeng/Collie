@@ -328,18 +328,21 @@ class TovaPruner(CollieModelForCausalLM):
         
         elif self.memory_type == MemoryType.FIXED_INCREMENTAL:
             # 类似AutoCompresser, 压缩后的kv cache都缓存下来, 且都被读取
-            incremental_key = key[:, :-self.chunk_size]
-            incremental_value = value[:, :-self.chunk_size]
-            if self.memory_size_limit is not None and incremental_key.shape[1] >= self.memory_size_limit:
-                return torch.cat([sink_key, incremental_key]), torch.cat([sink_value, incremental_value])
-            
-            kwargs_of_compress_func['key'] = key[:, -self.chunk_size:]
-            kwargs_of_compress_func['value'] = value[:, -self.chunk_size:]
+            memory_size = self.cached_indices[layer_idx].shape[-1] if self.cached_indices[layer_idx] is not None else 0
+            incremental_key = key[:, :memory_size]
+            incremental_value = value[:, :memory_size]
+            kwargs_of_compress_func['key'] = key[:, memory_size:]
+            kwargs_of_compress_func['value'] = value[:, memory_size:]
+
             if kwargs_of_compress_func['attention'] is not None:
-                kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:, :, :, -self.chunk_size:]
+                kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:, :, :, memory_size:]
             
             kwargs_of_compress_func['target_len'] = self.compressed_chunk_size # the compressed key size is constant
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
+            if self.memory_size_limit is not None and incremental_key.shape[1] + compressed_key.shape[1] > self.memory_size_limit:
+                overflow_size = incremental_key.shape[1] + compressed_key.shape[1] - self.memory_size_limit
+                incremental_key = incremental_key[:, overflow_size:]
+                incremental_value = incremental_value[:, overflow_size:]
             return torch.cat([sink_key, incremental_key, compressed_key], dim=1), torch.cat([sink_value, incremental_value, compressed_value], dim=1)
         
         elif self.memory_type == MemoryType.DYNAMIC_INCREMENTAL:
