@@ -17,9 +17,11 @@ from .utils import gradient_hook
 from functools import partial
 from enum import Enum, unique
 from collie.module import GPTLMLoss
+from collections import Counter
 
 class MemoryType:
     CHUNK_STREAMING="Chunk_Streaming"
+    DualMemory="dual_memory"
     FIXED_INCREMENTAL="Incremental_Chunk_Streaming_Fixed_History"
     DYNAMIC_INCREMENTAL="Incremental_Chunk_Streaming_Dynamic_History"
     DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS="dynamic_incremental_double_compress"
@@ -124,6 +126,8 @@ class TovaPruner(CollieModelForCausalLM):
         mem_perceiver.frozen_model()
         return mem_perceiver
 
+    def report_cached_indices(self):
+        return self.indices_counter
 
     def get_indices(self, attention, attention_shape, target_len, survive_indices=None):
         assert attention is not None
@@ -220,11 +224,13 @@ class TovaPruner(CollieModelForCausalLM):
                 sum_rate += r['avg']
             print(f'overall keep memory rate: {sum_rate / len(self.avg_memory_rate)}')
 
+    def compress_layer(self, key, value, attention, target_len, chunk_step, layer_idx, survive_indices=None):
         bsz, seq_len, num_heads, head_dim = key.shape
         if attention is None:
             attention_shape = (bsz, num_heads, seq_len, seq_len)
         else:
             attention_shape = attention.shape
+            assert attention_shape[-1] == seq_len
         if attention_shape[1] != num_heads:
             # support gqa
             assert attention_shape[1] % num_heads == 0
@@ -232,13 +238,14 @@ class TovaPruner(CollieModelForCausalLM):
             attention = attention.view(bsz, num_groups, num_heads, attention.shape[-2], attention.shape[-1])
             attention = attention.sum(dim=1)
             assert attention.shape[1] == num_heads
-        
-        topk_indices = self.get_indices(attention, attention_shape, target_len)
+        topk_indices = self.get_indices(attention, attention_shape, target_len, survive_indices)
         topk_indices = topk_indices.to(key.device)
-        # self.record_indices(topk_indices.view(-1) + chunk_step * self.chunk_size)
+        self.update_keep_memory_rate(topk_indices, layer_idx) # it must be before update_cached_indices
+        self.update_cached_indices(seq_len, topk_indices, chunk_step, layer_idx)
+        self.update_cached_freqs(seq_len, topk_indices, chunk_step, layer_idx)
         topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
         topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
-
+        
         selected_keys = torch.gather(key, index=topk_indices, dim=1)
         selected_values = torch.gather(value, index=topk_indices, dim=1)
         assert selected_keys.shape == (bsz, target_len, num_heads, head_dim)
@@ -251,7 +258,7 @@ class TovaPruner(CollieModelForCausalLM):
         for i, (key, value, attention) in enumerate(zip(keys, values, attentions)):
             selected_keys, selected_values = self.read_and_write_memory(
                 self.compress_layer,
-                key=key, value=value, attention=attention, chunk_step=chunk_step)
+                key=key, value=value, attention=attention, chunk_step=chunk_step, layer_idx=i)
             keeped_keys.append(selected_keys)
             keeped_values.append(selected_values)
         # print(f'before compression, key shape: {keys[0].shape}, value shape: {values[0].shape}, attention shape: {attentions[0].shape}')
@@ -319,8 +326,8 @@ class TovaPruner(CollieModelForCausalLM):
         return new_len
 
     def read_and_write_memory(self, compress_func, **kwargs_of_compress_func):
-        chunk_step = kwargs_of_compress_func.pop('chunk_step')
-        layer_idx = kwargs_of_compress_func['layer_idx']
+        chunk_step = kwargs_of_compress_func.get('chunk_step')
+        layer_idx = kwargs_of_compress_func.get('layer_idx')
         # write short-term memory to long-term memory, read from memory
         key = kwargs_of_compress_func['key']
         value = kwargs_of_compress_func['value']
@@ -424,12 +431,12 @@ class TovaPruner(CollieModelForCausalLM):
                 keys, values = [kv[0].detach() for kv in kv_cache], [kv[1].detach() for kv in kv_cache]
                 if self.compressed_chunk_size > 0:
                     # print(chunked_input_ids[i].shape, flush=True)
-                    if chunked_input_ids[i].shape[1] > self.compressed_chunk_size:
+                    if keys[0].shape[1] > self.compressed_chunk_size + self.num_sink_tokens:
                         compressed_keys, compressed_values = self.compress(keys=keys, values=values, attentions=attention_scores, chunk_step=i)
                     else:
                         compressed_keys, compressed_values = keys, values # we do not need to compress it, since it is already very small
                     # assert compressed_keys.requires_grad and compressed_values.requires_grad
-                    cached_compressed_kv = torch.stack([torch.stack([ck,cv], dim=0) for ck, cv in zip(compressed_keys, compressed_values)], dim=0) # [num_layers, 2, bsz, seq_len, num_heads, head_dim]
+                    cached_compressed_kv = [torch.stack([ck,cv], dim=0) for ck, cv in zip(compressed_keys, compressed_values)]# [num_layers, 2, bsz, seq_len, num_heads, head_dim]
                 else: # local windows
                     cached_compressed_kv = None
                 # we need to detach output to free memory
@@ -528,21 +535,32 @@ class TovaPruner(CollieModelForCausalLM):
         return mem_perceiver
 
 class StreamingLMPruner(TovaPruner):
-    def get_indices(self, attention, attention_shape, target_len, *args, **kwargs):
+    def get_indices(self, attention, attention_shape, target_len, survive_indices=None, *args, **kwargs):
         # indices shape: (bsz, num_heads, target_len)
         bsz, num_heads, seq_len = attention_shape[0], attention_shape[1], attention_shape[-1]
-        indices = torch.arange(seq_len)[-target_len:]
-        indices = indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
+        if survive_indices is not None:
+            raise NotImplementedError
+            # survive_num = survive_indices.shape[-1]
+            # other_num = seq_len-survive_num
+            # indices = torch.arange(seq_len)[-other_num:]
+            # indices = indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, other_num)
+            # indices = torch.cat([survive_indices, indices], dim=-1)
+        else:
+            indices = torch.arange(seq_len)[-target_len:]
+            indices = indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
         return indices
 
 class RandomPruner(TovaPruner):
     # sink tokens + random tokens
-    def get_indices(self, attention, attention_shape, target_len, *args, **kwargs):
+    def get_indices(self, attention, attention_shape, target_len, survive_indices=None, *args, **kwargs):
         bsz, num_heads, seq_len = attention_shape[0], attention_shape[1], attention_shape[-1]
         assert seq_len >= target_len
-        sample_indices = random.sample(range(seq_len), target_len)
-        token_indices = torch.arange(seq_len)[sample_indices]
-        token_indices = token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
+        if survive_indices is not None:
+            raise NotImplementedError
+        else:
+            sample_indices = random.sample(range(seq_len), target_len)
+            token_indices = torch.arange(seq_len)[sample_indices]
+            token_indices = token_indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
         return token_indices
 
 class ChunkPrefix(TovaPruner):
@@ -557,26 +575,28 @@ class ConvPruner(TovaPruner):
         self.kernel_size = kernel_size
         assert kernel_size % 2 != 0
 
-    def get_indices(self, attention, attention_shape, target_len):
+    def get_indices(self, attention, attention_shape, target_len, survive_indices=None):
         assert attention is not None
         chunk_size = min(self.chunk_size, attention.shape[-1])
         new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
         accum_attention_scores = new_attention_scores.sum(dim = 2) # (bsz, num_heads, seq_len)
         
         accum_attention_scores = nn.functional.avg_pool1d(accum_attention_scores, kernel_size=self.kernel_size, stride=1, padding=self.kernel_size // 2)
-        assert accum_attention_scores.shape[-1] == attention_shape[-1], f'{accum_attention_scores.shape=}, {attention_shape=}'
+        assert accum_attention_scores.shape[-1] == attention_shape[-1], f'{accum_attention_scores.shape=}, {attention_shape=}' 
         
         normalization_scores = torch.ones(attention.shape[-1], device=attention.device) * chunk_size
         normalization_scores[-chunk_size:] = chunk_size - torch.arange(chunk_size, device=attention.device)
         important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
 
+        if survive_indices is not None:
+            raise NotImplementedError
         important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
         important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
 
         return important_indices
 
 class ROCOPruner(TovaPruner):
-    def get_indices(self, attention, attention_shape, target_len):
+    def get_indices(self, attention, attention_shape, target_len, survive_indices=None):
         assert attention is not None
         chunk_size = min(self.chunk_size, attention.shape[-1])
         new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
@@ -599,6 +619,8 @@ class ROCOPruner(TovaPruner):
             index=std_removed_indices, 
             src=torch.zeros_like(std_removed_indices).type_as(important_scores)) # mask the kv with low variance
 
+        if survive_indices is not None:
+            raise NotImplementedError
         important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
 
         important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
