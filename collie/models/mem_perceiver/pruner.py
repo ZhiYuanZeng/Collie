@@ -246,6 +246,65 @@ class TovaPruner(CollieModelForCausalLM):
 
         return keeped_keys, keeped_values
     
+    def get_incremental_len(self, step,  layer_idx, incremental_type='linear'):
+        assert self.memory_size_limit is not None
+        incremental_base = 1
+        current_len = self.cached_indices[layer_idx].shape[-1] if self.cached_indices[layer_idx] is not None else 0
+        if incremental_type == 'linear':
+            incremental_len = self.compressed_chunk_size
+        elif incremental_type == 'layerwise_square':
+            if layer_idx > self.num_layers // 2:
+                incremental_len = self.compressed_chunk_size
+            else:
+                incremental_len = step ** 2 * ((self.memory_size_limit-self.compressed_chunk_size) / (self.num_steps-1) ** 2) + self.compressed_chunk_size - current_len
+        elif incremental_type == 'zero_order_adaptive':
+            if step == 0:
+                incremental_len = self.compressed_chunk_size
+            else:
+                ref_survive_rate=0.2
+                ref_incremental_size = self.compressed_chunk_size
+                scale = self.keep_memory_rate[layer_idx] / ref_survive_rate
+                incremental_len = ref_incremental_size * scale
+        elif incremental_type == 'firt_order_adaptive':
+            if step <= 1:
+                incremental_len = self.compressed_chunk_size
+            else:
+                ref_survive_rate=0.2
+                ref_incremental_size = self.compressed_chunk_size
+                scale = self.keep_memory_rate[layer_idx] / ref_survive_rate
+                beta = 0.9
+                if self.cached_scale[layer_idx] is None:
+                    self.cached_scale[layer_idx] = scale
+                self.cached_scale[layer_idx] = self.cached_scale[layer_idx] * beta + scale * (1-beta)
+                incremental_len = ref_incremental_size * self.cached_scale[layer_idx]
+        elif incremental_type == 'second_order_adaptive':
+            if step <= 1:
+                incremental_len = self.compressed_chunk_size
+            else:
+                ref_survive_rate=0.2
+                ref_incremental_size = self.compressed_chunk_size
+                scale = self.keep_memory_rate[layer_idx] / ref_survive_rate
+                beta = 0.7
+                alpha = 0.7
+                if self.cached_scale[layer_idx] is None:
+                    self.cached_scale[layer_idx] = scale
+                if self.cached_diff[layer_idx] is None:
+                    self.cached_diff[layer_idx] = 0
+                    # scale - self.cached_scale[layer_idx]
+                
+                self.cached_scale[layer_idx] = (self.cached_scale[layer_idx] + self.cached_diff[layer_idx]) * beta + scale * (1-beta)
+                self.cached_diff[layer_idx] = self.cached_diff[layer_idx] * alpha + (self.cached_scale[layer_idx] - scale) * (1-alpha) 
+
+                incremental_len = ref_incremental_size * self.cached_scale[layer_idx]
+        incremental_len = int((incremental_len // incremental_base) * incremental_base)
+        new_len = min(incremental_len + current_len, self.memory_size_limit)
+        if step == self.num_steps - 1:
+            new_len = self.memory_size_limit
+        # if layer_idx == 3 or layer_idx == 24:
+        #     print(f'layer {layer_idx}: {incremental_len=}')
+        # print(self.cached_scale[0])
+        return new_len
+
     def read_and_write_memory(self, compress_func, **kwargs_of_compress_func):
         chunk_step = kwargs_of_compress_func.pop('chunk_step')
         layer_idx = kwargs_of_compress_func['layer_idx']
