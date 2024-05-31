@@ -162,6 +162,21 @@ class TovaPruner(CollieModelForCausalLM):
         else:
             self.cached_indices[layer_idx] = torch.gather(global_indices, dim=-1, index=topk_indices)
 
+    def update_cached_freqs(self, seq_len, topk_indices, chunk_step, layer_idx):
+        if self.memory_type == MemoryType.FIXED_INCREMENTAL:
+            return
+        bsz, num_heads, target_len = topk_indices.shape
+        if self.cached_frequences[layer_idx] is None:
+            self.cached_frequences[layer_idx] = torch.ones(target_len, device=topk_indices.device).view(1,1,-1).expand(bsz, num_heads, target_len)
+        else:
+            self.cached_frequences[layer_idx] = self.cached_frequences[layer_idx] + 1
+            new_len = seq_len-self.cached_frequences[layer_idx].shape[-1]
+            new_frequences = torch.ones(new_len, device=topk_indices.device).view(1,1,-1).expand(bsz, num_heads, new_len)
+            new_frequences = torch.cat([self.cached_frequences[layer_idx], new_frequences], dim=-1)
+            self.cached_frequences[layer_idx] = torch.gather(new_frequences, index=topk_indices, dim=-1)
+            # if layer_idx == 0:
+            #     print(self.cached_frequences[layer_idx][0,0][:(seq_len-new_len)])
+
         bsz, seq_len, num_heads, head_dim = key.shape
         if attention is None:
             attention_shape = (bsz, num_heads, seq_len, seq_len)
