@@ -177,6 +177,32 @@ class TovaPruner(CollieModelForCausalLM):
             # if layer_idx == 0:
             #     print(self.cached_frequences[layer_idx][0,0][:(seq_len-new_len)])
 
+    def update_avg_memory_rate(self, k, v):
+        if self.avg_memory_rate[k] is None:
+            self.avg_memory_rate[k] = {'avg': 0, 'count': 0}
+
+        # 更新计数和总和
+        self.avg_memory_rate[k]['avg'] = (self.avg_memory_rate[k]['avg'] * self.avg_memory_rate[k]['count'] + v) / (self.avg_memory_rate[k]['count'] + 1)
+        self.avg_memory_rate[k]['count'] += 1
+
+    def update_keep_memory_rate(self, topk_indices, layer_idx):
+        if self.memory_type == MemoryType.FIXED_INCREMENTAL:
+            return
+        if self.cached_indices[layer_idx] is None:
+            return
+        else:
+            mem_size = self.cached_indices[layer_idx].shape[-1]
+            self.keep_memory_rate[layer_idx] = torch.sum(topk_indices < mem_size) / torch.numel(topk_indices)
+        self.update_avg_memory_rate(layer_idx, self.keep_memory_rate[layer_idx])
+
+    def report_keep_memory_rate(self):
+        if env.rank == 0:
+            sum_rate = 0
+            for i,r in enumerate(self.avg_memory_rate):
+                print(f'keep memory rate of layer {i}: {r["avg"]}')
+                sum_rate += r['avg']
+            print(f'overall keep memory rate: {sum_rate / len(self.avg_memory_rate)}')
+
         bsz, seq_len, num_heads, head_dim = key.shape
         if attention is None:
             attention_shape = (bsz, num_heads, seq_len, seq_len)
