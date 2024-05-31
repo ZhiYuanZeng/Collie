@@ -181,6 +181,32 @@ class TovaPruner(CollieModelForCausalLM):
             # if layer_idx == 0:
             #     print(self.cached_frequences[layer_idx][0,0][:(seq_len-new_len)])
 
+    def update_avg_memory_rate(self, k, v):
+        if self.avg_memory_rate[k] is None:
+            self.avg_memory_rate[k] = {'avg': 0, 'count': 0}
+
+        # 更新计数和总和
+        self.avg_memory_rate[k]['avg'] = (self.avg_memory_rate[k]['avg'] * self.avg_memory_rate[k]['count'] + v) / (self.avg_memory_rate[k]['count'] + 1)
+        self.avg_memory_rate[k]['count'] += 1
+
+    def update_keep_memory_rate(self, topk_indices, layer_idx):
+        if self.memory_type == MemoryType.FIXED_INCREMENTAL:
+            return
+        if self.cached_indices[layer_idx] is None:
+            return
+        else:
+            mem_size = self.cached_indices[layer_idx].shape[-1]
+            self.keep_memory_rate[layer_idx] = torch.sum(topk_indices < mem_size) / torch.numel(topk_indices)
+        self.update_avg_memory_rate(layer_idx, self.keep_memory_rate[layer_idx])
+
+    def report_keep_memory_rate(self):
+        if env.rank == 0:
+            sum_rate = 0
+            for i,r in enumerate(self.avg_memory_rate):
+                print(f'keep memory rate of layer {i}: {r["avg"]}')
+                sum_rate += r['avg']
+            print(f'overall keep memory rate: {sum_rate / len(self.avg_memory_rate)}')
+
         bsz, seq_len, num_heads, head_dim = key.shape
         if attention is None:
             attention_shape = (bsz, num_heads, seq_len, seq_len)
@@ -259,13 +285,25 @@ class TovaPruner(CollieModelForCausalLM):
         
         elif self.memory_type == MemoryType.DYNAMIC_INCREMENTAL:
             # memory在随着chunk数量的增加而变长，但是每次增长会刷新整个memory，而incremental memory只会在之前的基础上拼接新的memory
-            if self.memory_size_limit is not None:
-                kwargs_of_compress_func['target_len'] = min(self.compressed_chunk_size * (chunk_step + 1), self.memory_size_limit)
+            kwargs_of_compress_func['target_len'] = self.get_incremental_len(chunk_step, layer_idx, incremental_type=self.incremental_type)
+            if kwargs_of_compress_func['key'].shape[1] > kwargs_of_compress_func['target_len']:
+                compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
             else:
-                kwargs_of_compress_func['target_len'] = self.compressed_chunk_size * (chunk_step + 1) # incremental memory size
-
-            compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
+                compressed_key, compressed_value = kwargs_of_compress_func['key'], kwargs_of_compress_func['value']
                         
+            return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
+        
+        elif self.memory_type == MemoryType.DualMemory:
+            assert kwargs_of_compress_func['attention'] is not None
+            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size # the compressed memory size is constant
+            global_memory_size = int(kwargs_of_compress_func['target_len'] * 0.05)
+            if self.cached_frequences[layer_idx] is not None:
+                global_memory_freqs, global_memory_indices = torch.topk(self.cached_frequences[layer_idx], dim=-1, k=global_memory_size)
+                global_memory_freqs -= 0.5
+                self.cached_frequences[layer_idx] = self.cached_frequences[layer_idx].scatter(index=global_memory_indices, dim=-1, src=global_memory_freqs)
+                kwargs_of_compress_func['survive_indices'] = global_memory_indices
+            # count the frequence of the memory unit and keep the most frequent memory into long-term memory, which is not involved into pruning 
+            compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
             return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
         else:
             raise NotImplementedError
