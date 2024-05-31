@@ -82,21 +82,34 @@ class AutoPruner:
         return pruner
 
 class TovaPruner(CollieModelForCausalLM):
-    def __init__(self, config, chunk_size, compressed_chunk_size=0, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, separate_compress=False, memory_size_limit=None, **kwargs):
+    def __init__(self, config, chunk_size, compressed_chunk_size=0, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, separate_compress=False, memory_size_limit=None, compress_ratio=None, incremental_type='linear', **kwargs):
         super().__init__(config)
         self.model = model
         self.chunk_size = chunk_size
         self.compressed_chunk_size = compressed_chunk_size # the query len at inference may be different from that of training
+        self.compress_ratio = compress_ratio
+        if self.compress_ratio is not None and memory_type == MemoryType.CHUNK_STREAMING:
+            print('warning! using compress ratio to estimate compressed_chunk_size!')
+        else:
+            print('using compressed_chunk_size, ignoring compress_ratio')
         if self.model is not None:
             self.frozen_model()
         assert num_layers > 0
         self.num_sink_tokens = num_sink_tokens
         self.num_layers = num_layers
         self.memory_type = memory_type
-        self.cached_keys = [None for _ in range(num_layers)]
-        self.cached_values = [None for _ in range(num_layers)]
-        self.cached_attentions = [None for _ in range(num_layers)]
+
+        self.cached_indices = [None for _ in range(num_layers)]
+        self.cached_frequences = [None for _ in range(num_layers)]
+        self.cached_scale = [None for _ in range(num_layers)]
+        self.cached_diff = [None for _ in range(num_layers)]
+        self.keep_memory_rate = [None for _ in range(num_layers)]
+        self.avg_memory_rate = [None for _ in range(num_layers)]
+        self.indices_counter = [None for _ in range(num_layers)]
+
+        self.separate_compress = separate_compress
         self.memory_size_limit = memory_size_limit
+        self.incremental_type = incremental_type
 
     def frozen_model(self):
         for p in self.model.parameters():
@@ -466,9 +479,15 @@ class TovaPruner(CollieModelForCausalLM):
         return self.model.clean_cache()
 
     def clear_perceiver_cache(self):
-        self.cached_keys = [None for _ in range(self.num_layers)]
-        self.cached_values = [None for _ in range(self.num_layers)]
-        self.cached_attentions = [None for _ in range(self.num_layers)]
+        for i,ci in enumerate(self.cached_indices):
+            if self.indices_counter[i] is None:
+                self.indices_counter[i] = Counter(ci.view(-1).tolist())
+            else:
+                self.indices_counter[i] += Counter(ci.view(-1).tolist())
+                
+        self.cached_indices = [None for _ in range(self.num_layers)]
+        self.cached_frequences = [None for _ in range(self.num_layers)]
+        self.keep_memory_rate = [None for _ in range(self.num_layers)]
 
     @staticmethod
     def save_parallel_state_dict(state_dict: dict,
