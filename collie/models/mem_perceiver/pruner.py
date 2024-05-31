@@ -112,7 +112,7 @@ class TovaPruner(CollieModelForCausalLM):
         return mem_perceiver
 
 
-    def get_indices(self, attention, attention_shape, target_len):
+    def get_indices(self, attention, attention_shape, target_len, survive_indices=None):
         assert attention is not None
         chunk_size = min(self.chunk_size, attention.shape[-1])
         new_attention_scores = attention[:, :, -self.chunk_size:, :] # (bsz, num_heads, chunk_size, seq_len)
@@ -122,7 +122,11 @@ class TovaPruner(CollieModelForCausalLM):
         normalization_scores[-chunk_size:] = chunk_size - torch.arange(chunk_size, device=attention.device)
         # print(normalization_scores)
         important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
-
+        assert important_scores.shape[-1] >= target_len, f'{important_scores.shape=}, {target_len=}'
+        if survive_indices is not None:
+            important_scores = torch.scatter(
+                important_scores, dim=-1, index=survive_indices, 
+                src=torch.full(survive_indices.shape, 1e6, device=important_scores.device, dtype=important_scores.dtype))
         important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
         important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
         # print(self.move_avg('memory_ratio',
@@ -176,32 +180,6 @@ class TovaPruner(CollieModelForCausalLM):
             self.cached_frequences[layer_idx] = torch.gather(new_frequences, index=topk_indices, dim=-1)
             # if layer_idx == 0:
             #     print(self.cached_frequences[layer_idx][0,0][:(seq_len-new_len)])
-
-    def update_avg_memory_rate(self, k, v):
-        if self.avg_memory_rate[k] is None:
-            self.avg_memory_rate[k] = {'avg': 0, 'count': 0}
-
-        # 更新计数和总和
-        self.avg_memory_rate[k]['avg'] = (self.avg_memory_rate[k]['avg'] * self.avg_memory_rate[k]['count'] + v) / (self.avg_memory_rate[k]['count'] + 1)
-        self.avg_memory_rate[k]['count'] += 1
-
-    def update_keep_memory_rate(self, topk_indices, layer_idx):
-        if self.memory_type == MemoryType.FIXED_INCREMENTAL:
-            return
-        if self.cached_indices[layer_idx] is None:
-            return
-        else:
-            mem_size = self.cached_indices[layer_idx].shape[-1]
-            self.keep_memory_rate[layer_idx] = torch.sum(topk_indices < mem_size) / torch.numel(topk_indices)
-        self.update_avg_memory_rate(layer_idx, self.keep_memory_rate[layer_idx])
-
-    def report_keep_memory_rate(self):
-        if env.rank == 0:
-            sum_rate = 0
-            for i,r in enumerate(self.avg_memory_rate):
-                print(f'keep memory rate of layer {i}: {r["avg"]}')
-                sum_rate += r['avg']
-            print(f'overall keep memory rate: {sum_rate / len(self.avg_memory_rate)}')
 
         bsz, seq_len, num_heads, head_dim = key.shape
         if attention is None:
@@ -310,10 +288,17 @@ class TovaPruner(CollieModelForCausalLM):
             do compress
         """
         seq_len = input_ids.shape[1]
-        if seq_len > 1:
-            chunked_input_ids = torch.split(input_ids, self.chunk_size, dim=1) # TODO: 支持长度无法被均分的情况
+        elif self.memory_type == MemoryType.DualMemory:
+            assert kwargs_of_compress_func['attention'] is not None
+            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size # the compressed memory size is constant
+            global_memory_size = int(kwargs_of_compress_func['target_len'] * 0.05)
+            if self.cached_frequences[layer_idx] is not None:
+                global_memory_freqs, global_memory_indices = torch.topk(self.cached_frequences[layer_idx], dim=-1, k=global_memory_size)
+                global_memory_freqs -= 0.5
+                self.cached_frequences[layer_idx] = self.cached_frequences[layer_idx].scatter(index=global_memory_indices, dim=-1, src=global_memory_freqs)
+                kwargs_of_compress_func['survive_indices'] = global_memory_indices
+            # count the frequence of the memory unit and keep the most frequent memory into long-term memory, which is not involved into pruning 
             # chunked_attention_mask = torch.split(attention_mask, self.chunk_size, dim=1)
-            num_chunks = len(chunked_input_ids)
             
             cached_llm_outpus = []
 
