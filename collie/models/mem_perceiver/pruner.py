@@ -238,6 +238,8 @@ class TovaPruner(CollieModelForCausalLM):
             print(f'overall keep memory rate: {sum_rate / len(self.avg_memory_rate)}')
 
     def compress_layer(self, key, value, attention, target_len, chunk_step, layer_idx, survive_indices=None):
+        if key.shape[1] <= target_len:
+            return key, value
         bsz, seq_len, num_heads, head_dim = key.shape
         if attention is None:
             attention_shape = (bsz, num_heads, seq_len, seq_len)
@@ -612,6 +614,7 @@ class ConvPruner(TovaPruner):
 
         if survive_indices is not None:
             raise NotImplementedError
+        assert important_scores.shape[-1] >= target_len, f"{important_scores.shape[-1]}, {target_len}"
         important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
         important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
 
@@ -631,7 +634,7 @@ class ROCOPruner(TovaPruner):
         important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
         # v(x)=e(x^2)-e(x)^2
         std_scores = torch.sqrt(torch.sum(new_attention_scores**2) / normalization_scores - important_scores**2)
-        _, std_removed_indices = torch.topk(std_scores, k=self.compressed_chunk_size // 2, dim=-1, largest=False)
+        _, std_removed_indices = torch.topk(std_scores, k=target_len // 2, dim=-1, largest=False)
         
         mask_for_important_scores = torch.zeros_like(important_scores).bool()
         assert not torch.any(mask_for_important_scores)
