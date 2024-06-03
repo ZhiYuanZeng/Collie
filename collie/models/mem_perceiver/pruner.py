@@ -40,6 +40,15 @@ class PrunerType:
     ROCO="roco"
     CONV="conv"
 
+class IncrementalType:
+    LINEAR="linear"
+    SQUARE="square"
+    HALF_SQUARE_HALF_LINEAR="half_square_half_linear"
+    HALF_SQUARE_HALF_SQRT="half_square_half_sqrt"
+    ADAPTIVE="adaptive"
+    SMOOTH_ADAPTIVE="smooth_adaptive"
+    
+
 def build_llm_from_name_or_path(model_name_or_path, config):
     if 'llama' in model_name_or_path.lower():
         model = LlamaForCausalLM.from_pretrained(model_name_or_path, config=config, trust_remote_code=True)
@@ -274,58 +283,68 @@ class TovaPruner(CollieModelForCausalLM):
         assert self.memory_size_limit is not None
         incremental_base = 1
         current_len = self.cached_indices[layer_idx].shape[-1] if self.cached_indices[layer_idx] is not None else 0
-        if incremental_type == 'linear':
+        if incremental_type == IncrementalType.LINEAR:
             incremental_len = self.compressed_chunk_size
-        elif incremental_type == 'layerwise_square':
+        elif incremental_type == IncrementalType.SQUARE:
+            incremental_len = (step ** 2) * ((self.memory_size_limit-self.compressed_chunk_size) / (self.num_steps-1) ** 2) + self.compressed_chunk_size - current_len
+        elif incremental_type == IncrementalType.HALF_SQUARE_HALF_SQRT:
+            if layer_idx > self.num_layers // 2:
+                incremental_len = (step ** 0.5) * ((self.memory_size_limit-self.compressed_chunk_size) / (self.num_steps-1) ** 0.5) + self.compressed_chunk_size - current_len
+            else:
+                incremental_len = (step ** 2) * ((self.memory_size_limit-self.compressed_chunk_size) / (self.num_steps-1) ** 2) + self.compressed_chunk_size - current_len            
+        elif incremental_type == IncrementalType.HALF_SQUARE_HALF_LINEAR:
             if layer_idx > self.num_layers // 2:
                 incremental_len = self.compressed_chunk_size
             else:
                 incremental_len = step ** 2 * ((self.memory_size_limit-self.compressed_chunk_size) / (self.num_steps-1) ** 2) + self.compressed_chunk_size - current_len
-        elif incremental_type == 'zero_order_adaptive':
-            if step == 0:
-                incremental_len = self.compressed_chunk_size
-            else:
-                ref_survive_rate=0.2
-                ref_incremental_size = self.compressed_chunk_size
-                scale = self.keep_memory_rate[layer_idx] / ref_survive_rate
-                incremental_len = ref_incremental_size * scale
-        elif incremental_type == 'firt_order_adaptive':
+        elif incremental_type == IncrementalType.ADAPTIVE:
             if step <= 1:
                 incremental_len = self.compressed_chunk_size
             else:
-                ref_survive_rate=0.2
+                keep_rate = [r['avg'] for r in self.avg_memory_rate] 
+                layer_avg_keep_rate = sum(keep_rate) / self.num_layers
                 ref_incremental_size = self.compressed_chunk_size
-                scale = self.keep_memory_rate[layer_idx] / ref_survive_rate
+                scale = keep_rate[layer_idx] / layer_avg_keep_rate
+                incremental_len = ref_incremental_size * scale
+        elif incremental_type == IncrementalType.SMOOTH_ADAPTIVE:
+            if step <= 1:
+                incremental_len = self.compressed_chunk_size
+            else:                   
+                keep_rate = [r['avg'] for r in self.avg_memory_rate] 
+                layer_avg_keep_rate = sum(keep_rate) / self.num_layers
+                ref_incremental_size = self.compressed_chunk_size
+                scale = keep_rate[layer_idx] / layer_avg_keep_rate
                 beta = 0.9
                 if self.cached_scale[layer_idx] is None:
                     self.cached_scale[layer_idx] = scale
                 self.cached_scale[layer_idx] = self.cached_scale[layer_idx] * beta + scale * (1-beta)
+                # self.cached_scale[layer_idx] = min(self.cached_scale[layer_idx], 1)
                 incremental_len = ref_incremental_size * self.cached_scale[layer_idx]
-        elif incremental_type == 'second_order_adaptive':
-            if step <= 1:
-                incremental_len = self.compressed_chunk_size
-            else:
-                ref_survive_rate=0.2
-                ref_incremental_size = self.compressed_chunk_size
-                scale = self.keep_memory_rate[layer_idx] / ref_survive_rate
-                beta = 0.7
-                alpha = 0.7
-                if self.cached_scale[layer_idx] is None:
-                    self.cached_scale[layer_idx] = scale
-                if self.cached_diff[layer_idx] is None:
-                    self.cached_diff[layer_idx] = 0
-                    # scale - self.cached_scale[layer_idx]
+        # elif incremental_type == 'second_order_adaptive':
+        #     if step <= 1:
+        #         incremental_len = self.compressed_chunk_size
+        #     else:
+        #         ref_survive_rate=0.2
+        #         ref_incremental_size = self.compressed_chunk_size
+        #         scale = self.keep_memory_rate[layer_idx] / ref_survive_rate
+        #         beta = 0.7
+        #         alpha = 0.7
+        #         if self.cached_scale[layer_idx] is None:
+        #             self.cached_scale[layer_idx] = scale
+        #         if self.cached_diff[layer_idx] is None:
+        #             self.cached_diff[layer_idx] = 0
+        #             # scale - self.cached_scale[layer_idx]
                 
-                self.cached_scale[layer_idx] = (self.cached_scale[layer_idx] + self.cached_diff[layer_idx]) * beta + scale * (1-beta)
-                self.cached_diff[layer_idx] = self.cached_diff[layer_idx] * alpha + (self.cached_scale[layer_idx] - scale) * (1-alpha) 
+        #         self.cached_scale[layer_idx] = (self.cached_scale[layer_idx] + self.cached_diff[layer_idx]) * beta + scale * (1-beta)
+        #         self.cached_diff[layer_idx] = self.cached_diff[layer_idx] * alpha + (self.cached_scale[layer_idx] - scale) * (1-alpha) 
 
-                incremental_len = ref_incremental_size * self.cached_scale[layer_idx]
+        #         incremental_len = ref_incremental_size * self.cached_scale[layer_idx]
+        else:
+            raise NotImplementedError
         incremental_len = int((incremental_len // incremental_base) * incremental_base)
         new_len = min(incremental_len + current_len, self.memory_size_limit)
         if step == self.num_steps - 1:
             new_len = self.memory_size_limit
-        # if layer_idx == 3 or layer_idx == 24:
-        #     print(f'layer {layer_idx}: {incremental_len=}')
         # print(self.cached_scale[0])
         return new_len
 
