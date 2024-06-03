@@ -63,15 +63,17 @@ class AutoPruner:
         elif pruner_type == PrunerType.RANDOM:
             pruner = RandomPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         elif pruner_type == PrunerType.LOCAL_WINDOW: # remove context
-            config.mem_perceiver_config['compressed_chunk_size'] = 0
+            config.mem_perceiver_config['memory_size_limit'] = 0
             pruner = TovaPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         elif pruner_type == PrunerType.NO_COMPRESS:
             pruner = build_llm_from_name_or_path(pretrained_model_name_or_path, config) # no compress
         elif pruner_type == PrunerType.ROCO:
             config.use_flash = False
+            print('Warning: the roco pruner requires attention scores, therefore the flash_attention is set to False!')
             pruner = ROCOPruner.from_pretrained(pretrained_model_name_or_path, config)
         elif pruner_type == PrunerType.CONV:
             config.use_flash = False
+            print('Warning: the conv pruner requires attention scores, therefore the flash_attention is set to False!')
             pruner = ConvPruner.from_pretrained(pretrained_model_name_or_path, config)
         # parameters required
         elif pruner_type == PrunerType.PERCEIVER:
@@ -84,16 +86,16 @@ class AutoPruner:
         return pruner
 
 class TovaPruner(CollieModelForCausalLM):
-    def __init__(self, config, chunk_size, compressed_chunk_size=0, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, separate_compress=False, memory_size_limit=None, compress_ratio=None, incremental_type='linear', **kwargs):
+    def __init__(self, config, chunk_size, compressed_chunk_size=None, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, separate_compress=False, memory_size_limit=None, incremental_type='linear', **kwargs):
         super().__init__(config)
         self.model = model
         self.chunk_size = chunk_size
-        self.compressed_chunk_size = compressed_chunk_size # the query len at inference may be different from that of training
-        self.compress_ratio = compress_ratio
-        if self.compress_ratio is not None and memory_type == MemoryType.CHUNK_STREAMING:
-            print('warning! using compress ratio to estimate compressed_chunk_size!')
-        else:
-            print('using compressed_chunk_size, ignoring compress_ratio')
+        if compressed_chunk_size is not None:
+            print('warning! the compressed_chunk_size is ignored, it is set according to the memory size/compress ratio. it will be delete from args in the future')
+        self.compressed_chunk_size = None
+        # assert memory_size_limit is not None or compress_ratio is not None, "memory_size_limit or compress_ratio must be set!"
+        # assert memory_size_limit is None or compress_ratio is None, "memory_size_limit and compress_ratio can not be set at the same time!"
+        
         if self.model is not None:
             self.frozen_model()
         assert num_layers > 0
@@ -111,6 +113,8 @@ class TovaPruner(CollieModelForCausalLM):
 
         self.separate_compress = separate_compress
         self.memory_size_limit = memory_size_limit
+        assert memory_size_limit is not None
+        # self.compress_ratio = compress_ratio
         self.incremental_type = incremental_type
 
     def frozen_model(self):
@@ -341,13 +345,15 @@ class TovaPruner(CollieModelForCausalLM):
             kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:,:,:,self.num_sink_tokens:]
         
         if self.memory_type == MemoryType.CHUNK_STREAMING:
-            # 类似rmt读写compressed kv cache,但是每次写入会覆盖之前保存的compressed kv cache
+            self.compressed_chunk_size = self.memory_size_limit
             kwargs_of_compress_func['target_len'] = self.compressed_chunk_size # the compressed memory size is constant
+            # 类似rmt读写compressed kv cache,但是每次写入会覆盖之前保存的compressed kv cache
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
             return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
         
         elif self.memory_type == MemoryType.FIXED_INCREMENTAL:
             # 类似AutoCompresser, 压缩后的kv cache都缓存下来, 且都被读取
+            self.compressed_chunk_size = int(self.memory_size_limit // self.num_steps)
             memory_size = self.cached_indices[layer_idx].shape[-1] if self.cached_indices[layer_idx] is not None else 0
             incremental_key = key[:, :memory_size]
             incremental_value = value[:, :memory_size]
@@ -367,6 +373,7 @@ class TovaPruner(CollieModelForCausalLM):
         
         elif self.memory_type == MemoryType.DYNAMIC_INCREMENTAL:
             # memory在随着chunk数量的增加而变长，但是每次增长会刷新整个memory，而incremental memory只会在之前的基础上拼接新的memory
+            self.compressed_chunk_size = int(self.memory_size_limit // self.num_steps)
             kwargs_of_compress_func['target_len'] = self.get_incremental_len(chunk_step, layer_idx, incremental_type=self.incremental_type)
             if kwargs_of_compress_func['key'].shape[1] > kwargs_of_compress_func['target_len']:
                 compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
@@ -376,6 +383,7 @@ class TovaPruner(CollieModelForCausalLM):
             return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
         
         elif self.memory_type == MemoryType.DualMemory:
+            self.compressed_chunk_size = self.memory_size_limit
             assert kwargs_of_compress_func['attention'] is not None
             kwargs_of_compress_func['target_len'] = self.compressed_chunk_size # the compressed memory size is constant
             global_memory_size = int(kwargs_of_compress_func['target_len'] * 0.05)
@@ -409,8 +417,6 @@ class TovaPruner(CollieModelForCausalLM):
         """
         seq_len = input_ids.shape[1]
         if seq_len > 1:
-            if self.compress_ratio is not None and self.memory_type == MemoryType.CHUNK_STREAMING:
-                self.compressed_chunk_size = int(seq_len * self.compress_ratio)
             chunked_input_ids = torch.split(input_ids, self.chunk_size, dim=1) # TODO: 支持长度无法被均分的情况
             self.num_steps = len(chunked_input_ids)
             # chunked_attention_mask = torch.split(attention_mask, self.chunk_size, dim=1)
@@ -429,12 +435,9 @@ class TovaPruner(CollieModelForCausalLM):
                 attention_scores = model_outputs.attentions
 
                 keys, values = [kv[0].detach() for kv in kv_cache], [kv[1].detach() for kv in kv_cache]
-                if self.compressed_chunk_size > 0:
+                if self.memory_size_limit != 0:
                     # print(chunked_input_ids[i].shape, flush=True)
-                    if keys[0].shape[1] > self.compressed_chunk_size + self.num_sink_tokens:
-                        compressed_keys, compressed_values = self.compress(keys=keys, values=values, attentions=attention_scores, chunk_step=i)
-                    else:
-                        compressed_keys, compressed_values = keys, values # we do not need to compress it, since it is already very small
+                    compressed_keys, compressed_values = self.compress(keys=keys, values=values, attentions=attention_scores, chunk_step=i)
                     # assert compressed_keys.requires_grad and compressed_values.requires_grad
                     cached_compressed_kv = [torch.stack([ck,cv], dim=0) for ck, cv in zip(compressed_keys, compressed_values)]# [num_layers, 2, bsz, seq_len, num_heads, head_dim]
                 else: # local windows
