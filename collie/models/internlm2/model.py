@@ -698,6 +698,21 @@ class InternLM2DecoderLayer(nn.Module):
 
             position_ids = position_ids.unsqueeze(0)
 
+        # we need to overide the original attention_mask to support layerwise incremental memory
+        if self.config.attn_implementation == "flash_attention_2" or self.config.use_flash:
+            # 2d mask is passed through the layers
+            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
+        else:
+            past_key_values_length = 0
+            if past_key_value is not None:
+                # print(f'{len(past_key_value)=}, {len(past_key_value[0])=}', flush=True)
+                past_key_values_length = past_key_value[0][0].shape[1]
+            attention_mask = torch.ones(
+                (hidden_states.shape[0], hidden_states.shape[1] + past_key_values_length), dtype=torch.bool, device=hidden_states.device
+            )
+            attention_mask = self._prepare_decoder_attention_mask(
+                attention_mask, (hidden_states.shape[0], seq_length), hidden_states, past_key_values_length
+        )
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.attention(
             hidden_states=hidden_states,
@@ -716,6 +731,30 @@ class InternLM2DecoderLayer(nn.Module):
         hidden_states = self.feed_forward(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states, present_key_value, self_attn_weights
+
+    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
+        # create causal mask
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        combined_attention_mask = None
+        if input_shape[-1] > 1:
+            combined_attention_mask = _make_causal_mask(
+                input_shape,
+                inputs_embeds.dtype,
+                device=inputs_embeds.device,
+                past_key_values_length=past_key_values_length,
+            )
+
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
+                inputs_embeds.device
+            )
+            combined_attention_mask = (
+                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+            )
+
+        return combined_attention_mask
+
 
     def forward(self, inputs: dict):
         layer_past = inputs_to_kv_cache_for_layer(idx=self.idx, inputs=inputs)
@@ -940,12 +979,12 @@ class InternLM2Model(nn.Module):
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
-        if position_ids is None:
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
-            position_ids = torch.arange(
-                seq_length + past_key_values_length, dtype=torch.long, device=device
-            )
-            position_ids = position_ids.unsqueeze(0)
+        # if position_ids is None:
+        #     device = input_ids.device if input_ids is not None else inputs_embeds.device
+        #     position_ids = torch.arange(
+        #         seq_length + past_key_values_length, dtype=torch.long, device=device
+        #     )
+        #     position_ids = position_ids.unsqueeze(0)
         if inputs_embeds is None:
             inputs_embeds = self.tok_embeddings(input_ids)
 
