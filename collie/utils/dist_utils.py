@@ -247,10 +247,10 @@ def setup_distribution(config) -> None:
         else:
             master_port = "27002"
             os.environ["MASTER_PORT"] = master_port
-        if is_port_occupied(master_addr, int(master_port)):
-            free_port = find_free_port(master_addr)
-            raise RuntimeError(f"Port {master_port} is already in use, "
-                               f"please switch to port {free_port} by `export MASTER_PORT={free_port}` in terminal.")
+        # if is_port_occupied(master_addr, int(master_port)):
+        #     free_port = find_free_port(master_addr)
+        #     raise RuntimeError(f"Port {master_port} is already in use, "
+        #                        f"please switch to port {free_port} by `export MASTER_PORT={free_port}` in terminal.")
         os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
         os.environ["RANK"] = os.environ["SLURM_PROCID"]
         os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
