@@ -5,6 +5,7 @@ import torch
 import math
 from torch.nn.modules.activation import _arg_requires_grad, _check_arg_device, _is_make_fx_tracing
 from torch.nn.functional import scaled_dot_product_attention, linear, pad, softmax, _in_projection_packed, _none_or_dtype, _canonical_mask, has_torch_function, handle_torch_function, dropout, _mha_shape_check
+import matplotlib.pyplot as plt
 
 class PerceiverAttention(nn.MultiheadAttention):
     # clone from nn.MultiheadAttention
@@ -593,5 +594,197 @@ class Scale(nn.Module):
         b = self.b.view(input_shape)
         return w * x + b
     
-def gradient_hook(grad):
-    print(f"Gradient: {grad}")
+def gradient_hook(grad, param_name="UnKnown"):
+    print(f"Param_name: [{param_name}] Gradient: {grad}", flush=True)
+
+def visualize_prune(counters, figure_name, seq_len, chunk_size):
+    # chunk_size is used for down_sampling
+    v_matrix = np.zeros([len(counters), seq_len // chunk_size])
+    for i,layer_counter in enumerate(counters):
+        for k,v in layer_counter.items():
+            v_matrix[i, int(k)//chunk_size] += int(v)
+    print(v_matrix.shape)
+    v_matrix = v_matrix/(v_matrix.sum(axis=-1, keepdims=True)+1e-6)
+    print(v_matrix)
+    visualize_matrix(v_matrix, figure_name)
+
+def visualize_matrix(matrix, figure_name):
+    # 创建图形和轴
+    fig, ax = plt.subplots()
+
+    # 使用 imshow 可视化矩阵
+    cax = ax.imshow(matrix, cmap='viridis')
+
+    # 添加颜色条
+    fig.colorbar(cax)
+
+    # 设置刻度
+    ax.set_xticks(np.arange(matrix.shape[1]))
+    ax.set_yticks(np.arange(matrix.shape[0]))
+
+    # 设置刻度标签（可选）
+    ax.set_xticklabels(np.arange(matrix.shape[1]))
+    ax.set_yticklabels(np.arange(matrix.shape[0]))
+
+    # 显示网格线（可选）
+    ax.grid(False)
+
+    # 显示数值（可选）
+    # for i in range(matrix.shape[0]):
+    #     for j in range(matrix.shape[1]):
+    #         ax.text(j, i, matrix[i, j], ha='center', va='center', color='white')
+
+    # 显示图形
+    plt.savefig(f'imgs/{figure_name}')
+    plt.close()
+
+class IncrementalType:
+    LINEAR="linear"
+    SQUARE="square"
+    SQRT="sqrt"
+    INVERSE_CONVEX="inverse_convex"
+    INVERSE_CONCAVE="inverse_concave"
+    all_types = (LINEAR, SQUARE, SQRT, INVERSE_CONVEX, INVERSE_CONCAVE)
+
+class LayerwiseIncrementalType:
+    SQUARE_SQRT="square_sqrt"
+    DOUBLE_INVERSE="double_inverse"
+    ADAPTIVE="adaptive"
+    SMOOTH_ADAPTIVE="smooth_adaptive"
+    all_types = (SQUARE_SQRT, DOUBLE_INVERSE, ADAPTIVE, SMOOTH_ADAPTIVE)
+    
+
+class MemSizeScheduler:
+    def __init__(self, chunk_size, max_mem_size, incremental_type=None, num_layers=None) -> None:
+        self.chunk_size = chunk_size
+        self.max_mem_size = max_mem_size
+        self.incremental_type = incremental_type
+        self.num_layers = num_layers
+    
+    def _get_num_chunks(self, seq_len):
+        if seq_len % self.chunk_size == 0:
+            num_chunks = seq_len // self.chunk_size
+        else:
+            num_chunks = seq_len // self.chunk_size + 1
+        return num_chunks
+    
+    def get_incremental_memsize(self, step, seq_len, incremental_type=None):
+        if incremental_type is None:
+            incremental_type = self.incremental_type
+        num_chunks = self._get_num_chunks(seq_len=seq_len)
+        assert self.max_mem_size is not None
+        if step >= (num_chunks-1):
+            return self.max_mem_size
+
+        avg_mem_size_per_chunk = self.max_mem_size // num_chunks
+        if incremental_type == IncrementalType.LINEAR:
+            incremental_len = avg_mem_size_per_chunk * (step+1)
+        elif incremental_type == IncrementalType.SQUARE:
+            incremental_len = (step ** 2) * ((self.max_mem_size-avg_mem_size_per_chunk) / (num_chunks-1) ** 2) + avg_mem_size_per_chunk
+        elif incremental_type == IncrementalType.SQRT:
+            incremental_len = (step ** 0.5) * ((self.max_mem_size-avg_mem_size_per_chunk) / (num_chunks-1) ** 0.5) + avg_mem_size_per_chunk
+        elif incremental_type == IncrementalType.INVERSE_CONVEX:
+            incremental_len = self.max_mem_size / (num_chunks -  step)
+        elif incremental_type == IncrementalType.INVERSE_CONCAVE:
+            incremental_len = self.max_mem_size + avg_mem_size_per_chunk - self.max_mem_size / (step + 1)
+        else:
+            raise NotImplementedError(incremental_type)
+        
+        return int(incremental_len)
+    
+    def get_layerwise_incremental_memsize(self, step, seq_len, layer_idx, keep_memory_rate):
+        num_chunks = self._get_num_chunks(seq_len=seq_len)
+        avg_mem_size_per_chunk = self.max_mem_size // num_chunks
+
+        if step+1 == num_chunks:
+            return self.max_mem_size
+        assert self.num_layers is not None and layer_idx < self.num_layers, f'{self.num_layers=}, {layer_idx=}'
+        if self.incremental_type == LayerwiseIncrementalType.SQUARE_SQRT:
+            if layer_idx < self.num_layers // 2:
+                return self.get_incremental_memsize(step, seq_len, incremental_type=IncrementalType.SQUARE)
+            else:
+                return self.get_incremental_memsize(step, seq_len, incremental_type=IncrementalType.SQRT)
+        elif self.incremental_type == LayerwiseIncrementalType.DOUBLE_INVERSE:
+            if layer_idx < self.num_layers // 2:
+                return self.get_incremental_memsize(step, seq_len, incremental_type=IncrementalType.INVERSE_CONVEX)
+            else:
+                return self.get_incremental_memsize(step, seq_len, incremental_type=IncrementalType.INVERSE_CONCAVE)
+        elif self.incremental_type == LayerwiseIncrementalType.ADAPTIVE:
+            assert keep_memory_rate is not None
+            if step == 0:
+                incremental_len = avg_mem_size_per_chunk
+            elif step == 1:
+                incremental_len = 2 * avg_mem_size_per_chunk
+            else:
+                keep_rate = [r['avg'] for r in keep_memory_rate] 
+                normalized_keep_rate = torch.tensor(keep_rate).softmax(dim=-1)
+                # print(keep_rate, normalized_keep_rate, flush=True)
+                incremental_len = (step+1) * avg_mem_size_per_chunk * self.num_layers * normalized_keep_rate[layer_idx].item()
+                incremental_len = min(incremental_len, self.max_mem_size)
+            return int(incremental_len)
+    
+    def get_fix_memsize(self):
+        return self.max_mem_size
+    
+    def get_fix_incremental_memsize(self, step, seq_len):
+        def split_list_lengths(n, k):
+            base_length = n // k
+            extra = n % k
+            
+            lengths = [base_length + 1 if i < extra else base_length for i in range(k)]
+            return lengths
+        
+        num_chunks = self._get_num_chunks(seq_len)
+        memsizes = split_list_lengths(self.max_mem_size, num_chunks)
+        assert len(memsizes) == num_chunks
+        if step >= num_chunks:
+            return memsizes[-1]
+        else:
+            return memsizes[step]
+
+    def get_memsize(self, step=None, seq_len=None, layer_idx=None, keep_memory_rate=None, min_chunk_size=1024, min_mem_size=256):
+        if self.incremental_type is None:
+            return self.get_fix_memsize()
+        elif self.incremental_type in IncrementalType.all_types:
+            return self.get_incremental_memsize(step, seq_len)
+        elif self.incremental_type in LayerwiseIncrementalType.all_types:
+            return self.get_layerwise_incremental_memsize(step, seq_len, layer_idx, keep_memory_rate)
+        else:
+            raise NotImplementedError
+        # elif self.incremental_type == 'decremental_chunk':
+        #     return self.get_increment_memsize_according_to_max_and_mean(seq_len, step, min_chunk_size, min_mem_size)
+
+class ChunkSizeScheduler:
+    def __init__(self, ref_chunk_size) -> None:
+        self.ref_chunk_size = ref_chunk_size
+
+    def divide_list_max_length(self, n, k):
+        # 计算总共需要多少个子列表
+        num_sublists = (n + k - 1) // k
+        
+        # 创建每个子列表的长度
+        sublist_lengths = [k] * num_sublists
+        
+        # 处理最后一个子列表的长度
+        if n % k != 0:
+            sublist_lengths[-1] = n % k
+        
+        return sublist_lengths 
+
+    def get_std_chunk_sizes(self, seq_len):
+        return self.divide_list_max_length(seq_len, self.ref_chunk_size)
+
+    def get_decremental_chunk_sizes(self, seq_len, mem_size_shechuler:MemSizeScheduler):
+        num_chunks = mem_size_shechuler._get_num_chunks(seq_len)
+        avg_chunk_size = seq_len // num_chunks
+        if num_chunks == 1:
+            return avg_chunk_size
+        assert self.ref_chunk_size == mem_size_shechuler.chunk_size
+        mem_sizes = [mem_size_shechuler.get_memsize(i, seq_len) for i in range(num_chunks)]
+        avg_mem_size = sum(mem_sizes[:-1]) // (len(mem_sizes)-1)
+        avg_chunk_size = seq_len // num_chunks
+        draft_chunk_sizes = [avg_chunk_size,] + [avg_chunk_size + avg_mem_size - mem_sizes[i-1] for i in range(1, num_chunks)]
+        draft_chunk_sizes[-1] = seq_len-sum(draft_chunk_sizes[:-1])
+        # print(mem_sizes, flush=True)
+        # print(draft_chunk_sizes, flush=True)
+        return draft_chunk_sizes
