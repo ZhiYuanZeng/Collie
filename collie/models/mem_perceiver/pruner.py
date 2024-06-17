@@ -13,7 +13,7 @@ import math
 import random
 from typing import Any
 from collie.utils import env
-from .utils import gradient_hook
+from .utils import ChunkSizeScheduler, MemSizeScheduler, IncrementalType, LayerwiseIncrementalType
 from functools import partial
 from enum import Enum, unique
 from collie.module import GPTLMLoss
@@ -40,13 +40,13 @@ class PrunerType:
     ROCO="roco"
     CONV="conv"
 
-class IncrementalType:
-    LINEAR="linear"
-    SQUARE="square"
-    HALF_SQUARE_HALF_LINEAR="half_square_half_linear"
-    HALF_SQUARE_HALF_SQRT="half_square_half_sqrt"
-    ADAPTIVE="adaptive"
-    SMOOTH_ADAPTIVE="smooth_adaptive"
+# class IncrementalType:
+#     LINEAR="linear"
+#     SQUARE="square"
+#     HALF_SQUARE_HALF_LINEAR="half_square_half_linear"
+#     HALF_SQUARE_HALF_SQRT="half_square_half_sqrt"
+#     ADAPTIVE="adaptive"
+#     SMOOTH_ADAPTIVE="smooth_adaptive"
     
 
 def build_llm_from_name_or_path(model_name_or_path, config):
@@ -95,7 +95,7 @@ class AutoPruner:
         return pruner
 
 class TovaPruner(CollieModelForCausalLM):
-    def __init__(self, config, chunk_size, compressed_chunk_size=None, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, separate_compress=False, memory_size_limit=None, incremental_type='linear', **kwargs):
+    def __init__(self, config, chunk_size, compressed_chunk_size=None, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, separate_compress=False, memory_size_limit=None, incremental_type='linear', eval_len=None, decremental_chunk=False, **kwargs):
         super().__init__(config)
         self.model = model
         self.chunk_size = chunk_size
@@ -117,7 +117,8 @@ class TovaPruner(CollieModelForCausalLM):
         self.cached_scale = [None for _ in range(num_layers)]
         self.cached_diff = [None for _ in range(num_layers)]
         self.keep_memory_rate = [None for _ in range(num_layers)]
-        self.avg_memory_rate = [None for _ in range(num_layers)]
+        self.avg_memory_rate = {}
+        self.avg_memory_usage = {}
         self.indices_counter = [None for _ in range(num_layers)]
 
         self.separate_compress = separate_compress
@@ -125,6 +126,11 @@ class TovaPruner(CollieModelForCausalLM):
         assert memory_size_limit is not None
         # self.compress_ratio = compress_ratio
         self.incremental_type = incremental_type
+        self.chunksize_scheduler = ChunkSizeScheduler(chunk_size)
+        self.memsize_scheduler = MemSizeScheduler(chunk_size, max_mem_size=memory_size_limit, incremental_type=incremental_type, num_layers=num_layers)
+        self.eval_len = eval_len
+        self.decremental_chunk = decremental_chunk
+        self.transpose_kv = False
 
     def frozen_model(self):
         for p in self.model.parameters():
@@ -141,6 +147,48 @@ class TovaPruner(CollieModelForCausalLM):
 
     def report_cached_indices(self):
         return self.indices_counter
+
+    def report_forgive_process(self, step):
+        if self.cached_indices[0] is not None:
+            # report the number of kv of the first chunk remained in the memory while iteration
+            is_kv_from_first_chunk = [ci < self.chunk_size for ci in self.cached_indices]
+            first_chunk_keep_rate = [ikfc.float().mean() for ikfc in is_kv_from_first_chunk]
+            avg_ikfc = sum(first_chunk_keep_rate) / len(first_chunk_keep_rate)
+            print(f'{step=}, {avg_ikfc=}')
+    
+    
+    def report_avg_keep_memory_rate(self):
+        if env.rank == 0:
+            layer_keep_memory_rate = []
+            step_keep_memory_rate = []
+            for k,v in self.avg_memory_rate.items():
+                if 'layer' in k:
+                    layer_keep_memory_rate.append((k,v))
+            for k,v in self.avg_memory_rate.items():
+                if 'step' in k:
+                    step_keep_memory_rate.append((k,v))
+            print('average keep memory rate of layers:', layer_keep_memory_rate)
+            print('average keep memory rate of steps:', step_keep_memory_rate)
+
+    def report_step_keep_memory_rate(self, step):
+        if self.keep_memory_rate[0] is not None:
+            avg_memory_rate = sum(self.keep_memory_rate) / len(self.keep_memory_rate)
+            print(f'step: {step}, keep-memory-rate: {avg_memory_rate}')
+            # print(f'keep-memory-rate of all layers: {self.keep_memory_rate}')
+
+
+    def report_memory_usage(self):
+        if env.rank == 0:
+            valid_num = []
+            valid_value = []
+            for k,v in self.avg_memory_usage.items():
+                if 'num' in k:
+                    valid_num.append((k,v))
+            for k,v in self.avg_memory_usage.items():
+                if 'score' in k:
+                    valid_value.append((k,v))
+            print('memory usage (num valid):', valid_num)
+            print('memory usage (mean attn score):', valid_value)
 
     def get_indices(self, attention, attention_shape, target_len, survive_indices=None):
         assert attention is not None
@@ -159,42 +207,40 @@ class TovaPruner(CollieModelForCausalLM):
                 src=torch.full(survive_indices.shape, 1e6, device=important_scores.device, dtype=important_scores.dtype))
         important_indices = torch.topk(important_scores, dim=-1, k=target_len).indices
         important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
-        # print(self.move_avg('memory_ratio',
-        #     torch.sum(important_indices < self.compressed_chunk_size).item() / torch.numel(important_indices)
-        # ))
         
         return important_indices
 
     def update_cached_indices(self, seq_len, topk_indices, chunk_step, layer_idx):
         bsz, num_heads, _ = topk_indices.shape
         if self.cached_indices[layer_idx] is not None:
-            if self.memory_type == MemoryType.FIXED_INCREMENTAL:
-                assert seq_len <= self.chunk_size
-                new_chunk_size = seq_len
-                global_indices = self.chunk_size * chunk_step + \
-                    torch.arange(new_chunk_size, device=topk_indices.device).view(1,1,new_chunk_size).expand(bsz, num_heads, new_chunk_size)
-            else:
-                new_chunk_size = seq_len - self.cached_indices[layer_idx].shape[-1]
-                new_chunk_indices = self.chunk_size * chunk_step + \
-                    torch.arange(new_chunk_size, device=topk_indices.device).view(1,1,new_chunk_size).expand(bsz, num_heads, new_chunk_size)
-                global_indices = torch.cat([self.cached_indices[layer_idx], new_chunk_indices], dim=-1)
-                # if layer_idx == 0:
-                #     print(self.cached_indices[layer_idx][0,0][:(seq_len-new_chunk_size)])
+            new_chunk_size = seq_len - self.cached_indices[layer_idx].shape[-1]
+            new_chunk_indices = self.chunk_size * chunk_step + \
+                torch.arange(new_chunk_size, device=topk_indices.device).view(1,1,new_chunk_size).expand(bsz, num_heads, new_chunk_size)
+            global_indices = torch.cat([self.cached_indices[layer_idx], new_chunk_indices], dim=-1)
+            # if layer_idx == 0:
+            #     print(self.cached_indices[layer_idx][0,0][:(seq_len-new_chunk_size)])
 
         else:
             new_chunk_indices = self.num_sink_tokens + torch.arange(seq_len, device=topk_indices.device).view(1,1,seq_len).expand(bsz, num_heads, seq_len)
             global_indices = new_chunk_indices
         assert global_indices.shape[-1] == seq_len
 
-        if self.memory_type == MemoryType.FIXED_INCREMENTAL:
-            if self.cached_indices[layer_idx] is None:
-                self.cached_indices[layer_idx] = torch.gather(global_indices, dim=-1, index=topk_indices)
-            else:
-                self.cached_indices[layer_idx] = torch.cat(
-                    [self.cached_indices[layer_idx], torch.gather(global_indices, dim=-1, index=topk_indices)], dim=-1
-                )
-        else:
-            self.cached_indices[layer_idx] = torch.gather(global_indices, dim=-1, index=topk_indices)
+        self.cached_indices[layer_idx] = torch.gather(global_indices, dim=-1, index=topk_indices)
+
+    def update_memory_usage(self, seq_len, layer_idx, chunk_step, attention_scores):
+        if self.cached_indices[layer_idx] is None:
+            return
+        memory_size = self.cached_indices[layer_idx].shape[-1]
+        # attention shape: bsz, num_heads, seq_len, seq_len
+        assert attention_scores is not None
+        chunk_size = seq_len - memory_size
+        valid_attention_scores = attention_scores[:, :, -chunk_size:]
+        avg_attention_scores = valid_attention_scores.mean(dim=2) # (bsz, num_heads, seq_len)
+        memory_attention_scores = avg_attention_scores[:, :, :memory_size]
+        num_valid_memory_kv = torch.sum(memory_attention_scores > attention_scores.mean())/memory_attention_scores.numel()
+        valid_memory_score = memory_attention_scores.mean()
+        self.update_move_avg(self.avg_memory_usage, f'num_{chunk_step}', num_valid_memory_kv.item())
+        self.update_move_avg(self.avg_memory_usage, f'score_{chunk_step}', valid_memory_score.item())
 
     def update_cached_freqs(self, seq_len, topk_indices, chunk_step, layer_idx):
         if self.memory_type == MemoryType.FIXED_INCREMENTAL:
@@ -211,15 +257,15 @@ class TovaPruner(CollieModelForCausalLM):
             # if layer_idx == 0:
             #     print(self.cached_frequences[layer_idx][0,0][:(seq_len-new_len)])
 
-    def update_avg_memory_rate(self, k, v):
-        if self.avg_memory_rate[k] is None:
-            self.avg_memory_rate[k] = {'avg': 0, 'count': 0}
+    def update_move_avg(self, avg_states, k, v):
+        if avg_states.get(k, None) is None:
+            avg_states[k] = {'avg': 0, 'count': 0}
 
         # 更新计数和总和
-        self.avg_memory_rate[k]['avg'] = (self.avg_memory_rate[k]['avg'] * self.avg_memory_rate[k]['count'] + v) / (self.avg_memory_rate[k]['count'] + 1)
-        self.avg_memory_rate[k]['count'] += 1
-
-    def update_keep_memory_rate(self, topk_indices, layer_idx):
+        avg_states[k]['avg'] = (avg_states[k]['avg'] * avg_states[k]['count'] + v) / (avg_states[k]['count'] + 1)
+        avg_states[k]['count'] += 1
+    
+    def update_keep_memory_rate(self, topk_indices, layer_idx, chunk_step):
         if self.memory_type == MemoryType.FIXED_INCREMENTAL:
             return
         if self.cached_indices[layer_idx] is None:
@@ -227,24 +273,18 @@ class TovaPruner(CollieModelForCausalLM):
         else:
             mem_size = self.cached_indices[layer_idx].shape[-1]
             self.keep_memory_rate[layer_idx] = torch.sum(topk_indices < mem_size) / torch.numel(topk_indices)
-        self.update_avg_memory_rate(layer_idx, self.keep_memory_rate[layer_idx])
-
-    def report_keep_memory_rate(self):
-        if env.rank == 0:
-            sum_rate = 0
-            for i,r in enumerate(self.avg_memory_rate):
-                print(f'keep memory rate of layer {i}: {r["avg"]}')
-                sum_rate += r['avg']
-            print(f'overall keep memory rate: {sum_rate / len(self.avg_memory_rate)}')
+            self.keep_memory_rate[layer_idx] = self.keep_memory_rate[layer_idx].item()
+            self.update_move_avg(self.avg_memory_rate, f'{layer_idx=}', self.keep_memory_rate[layer_idx]) # average on setp
+            self.update_move_avg(self.avg_memory_rate, f'{chunk_step=}', self.keep_memory_rate[layer_idx]) # average on layer                              
 
     def compress_layer(self, key, value, attention, target_len, chunk_step, layer_idx, survive_indices=None):
         if key.shape[1] <= target_len:
             return key, value
         bsz, seq_len, num_heads, head_dim = key.shape
         if attention is None:
-            attention_shape = (bsz, num_heads, seq_len, seq_len)
+            attention_shape = [bsz, num_heads, seq_len, seq_len]
         else:
-            attention_shape = attention.shape
+            attention_shape = list(attention.shape)
             assert attention_shape[-1] == seq_len
         if attention_shape[1] != num_heads:
             # support gqa
@@ -253,9 +293,12 @@ class TovaPruner(CollieModelForCausalLM):
             attention = attention.view(bsz, num_groups, num_heads, attention.shape[-2], attention.shape[-1])
             attention = attention.sum(dim=1)
             assert attention.shape[1] == num_heads
+            attention_shape[1] = num_heads
         topk_indices = self.get_indices(attention, attention_shape, target_len, survive_indices)
+        assert topk_indices.shape[1] == num_heads, f"{topk_indices.shape=}, {attention.shape=}"
         topk_indices = topk_indices.to(key.device)
-        self.update_keep_memory_rate(topk_indices, layer_idx) # it must be before update_cached_indices
+        self.update_memory_usage(seq_len=seq_len, layer_idx=layer_idx, chunk_step=chunk_step, attention_scores=attention)
+        self.update_keep_memory_rate(topk_indices, layer_idx, chunk_step) # it must be before update_cached_indices
         self.update_cached_indices(seq_len, topk_indices, chunk_step, layer_idx)
         self.update_cached_freqs(seq_len, topk_indices, chunk_step, layer_idx)
         topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
@@ -280,75 +323,6 @@ class TovaPruner(CollieModelForCausalLM):
         # print(f'after compression, key shape: {keeped_keys[0].shape}, value shape: {keeped_values[0].shape}')
 
         return keeped_keys, keeped_values
-    
-    def get_incremental_len(self, step,  layer_idx, incremental_type='linear'):
-        assert self.memory_size_limit is not None
-        incremental_base = 1
-        current_len = self.cached_indices[layer_idx].shape[-1] if self.cached_indices[layer_idx] is not None else 0
-        if incremental_type == IncrementalType.LINEAR:
-            incremental_len = self.compressed_chunk_size
-        elif incremental_type == IncrementalType.SQUARE:
-            incremental_len = (step ** 2) * ((self.memory_size_limit-self.compressed_chunk_size) / (self.num_steps-1) ** 2) + self.compressed_chunk_size - current_len
-        elif incremental_type == IncrementalType.HALF_SQUARE_HALF_SQRT:
-            if layer_idx > self.num_layers // 2:
-                incremental_len = (step ** 0.5) * ((self.memory_size_limit-self.compressed_chunk_size) / (self.num_steps-1) ** 0.5) + self.compressed_chunk_size - current_len
-            else:
-                incremental_len = (step ** 2) * ((self.memory_size_limit-self.compressed_chunk_size) / (self.num_steps-1) ** 2) + self.compressed_chunk_size - current_len            
-        elif incremental_type == IncrementalType.HALF_SQUARE_HALF_LINEAR:
-            if layer_idx > self.num_layers // 2:
-                incremental_len = self.compressed_chunk_size
-            else:
-                incremental_len = step ** 2 * ((self.memory_size_limit-self.compressed_chunk_size) / (self.num_steps-1) ** 2) + self.compressed_chunk_size - current_len
-        elif incremental_type == IncrementalType.ADAPTIVE:
-            if step <= 1:
-                incremental_len = self.compressed_chunk_size
-            else:
-                keep_rate = [r['avg'] for r in self.avg_memory_rate] 
-                layer_avg_keep_rate = sum(keep_rate) / self.num_layers
-                ref_incremental_size = self.compressed_chunk_size
-                scale = keep_rate[layer_idx] / layer_avg_keep_rate
-                incremental_len = ref_incremental_size * scale
-        elif incremental_type == IncrementalType.SMOOTH_ADAPTIVE:
-            if step <= 1:
-                incremental_len = self.compressed_chunk_size
-            else:                   
-                keep_rate = [r['avg'] for r in self.avg_memory_rate] 
-                layer_avg_keep_rate = sum(keep_rate) / self.num_layers
-                ref_incremental_size = self.compressed_chunk_size
-                scale = keep_rate[layer_idx] / layer_avg_keep_rate
-                beta = 0.9
-                if self.cached_scale[layer_idx] is None:
-                    self.cached_scale[layer_idx] = scale
-                self.cached_scale[layer_idx] = self.cached_scale[layer_idx] * beta + scale * (1-beta)
-                # self.cached_scale[layer_idx] = min(self.cached_scale[layer_idx], 1)
-                incremental_len = ref_incremental_size * self.cached_scale[layer_idx]
-        # elif incremental_type == 'second_order_adaptive':
-        #     if step <= 1:
-        #         incremental_len = self.compressed_chunk_size
-        #     else:
-        #         ref_survive_rate=0.2
-        #         ref_incremental_size = self.compressed_chunk_size
-        #         scale = self.keep_memory_rate[layer_idx] / ref_survive_rate
-        #         beta = 0.7
-        #         alpha = 0.7
-        #         if self.cached_scale[layer_idx] is None:
-        #             self.cached_scale[layer_idx] = scale
-        #         if self.cached_diff[layer_idx] is None:
-        #             self.cached_diff[layer_idx] = 0
-        #             # scale - self.cached_scale[layer_idx]
-                
-        #         self.cached_scale[layer_idx] = (self.cached_scale[layer_idx] + self.cached_diff[layer_idx]) * beta + scale * (1-beta)
-        #         self.cached_diff[layer_idx] = self.cached_diff[layer_idx] * alpha + (self.cached_scale[layer_idx] - scale) * (1-alpha) 
-
-        #         incremental_len = ref_incremental_size * self.cached_scale[layer_idx]
-        else:
-            raise NotImplementedError
-        incremental_len = int((incremental_len // incremental_base) * incremental_base)
-        new_len = min(incremental_len + current_len, self.memory_size_limit)
-        if step == self.num_steps - 1:
-            new_len = self.memory_size_limit
-        # print(self.cached_scale[0])
-        return new_len
 
     def read_and_write_memory(self, compress_func, **kwargs_of_compress_func):
         chunk_step = kwargs_of_compress_func.get('chunk_step')
@@ -366,15 +340,13 @@ class TovaPruner(CollieModelForCausalLM):
             kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:,:,:,self.num_sink_tokens:]
         
         if self.memory_type == MemoryType.CHUNK_STREAMING:
-            self.compressed_chunk_size = self.memory_size_limit
-            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size # the compressed memory size is constant
+            kwargs_of_compress_func['target_len'] = self.memsize_scheduler.get_fix_memsize() # the compressed memory size is constant
             # 类似rmt读写compressed kv cache,但是每次写入会覆盖之前保存的compressed kv cache
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
             return torch.cat([sink_key, compressed_key], dim=1), torch.cat([sink_value, compressed_value], dim=1)
         
         elif self.memory_type == MemoryType.FIXED_INCREMENTAL:
             # 类似AutoCompresser, 压缩后的kv cache都缓存下来, 且都被读取
-            self.compressed_chunk_size = int(self.memory_size_limit // self.num_steps)
             memory_size = self.cached_indices[layer_idx].shape[-1] if self.cached_indices[layer_idx] is not None else 0
             incremental_key = key[:, :memory_size]
             incremental_value = value[:, :memory_size]
@@ -384,18 +356,13 @@ class TovaPruner(CollieModelForCausalLM):
             if kwargs_of_compress_func['attention'] is not None:
                 kwargs_of_compress_func['attention'] = kwargs_of_compress_func['attention'][:, :, :, memory_size:]
             
-            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size # the compressed key size is constant
+            kwargs_of_compress_func['target_len'] = self.memsize_scheduler.get_fix_incremental_memsize(chunk_step, self.seq_len) # the compressed key size is constant
             compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
-            if self.memory_size_limit is not None and incremental_key.shape[1] + compressed_key.shape[1] > self.memory_size_limit:
-                overflow_size = incremental_key.shape[1] + compressed_key.shape[1] - self.memory_size_limit
-                incremental_key = incremental_key[:, overflow_size:]
-                incremental_value = incremental_value[:, overflow_size:]
             return torch.cat([sink_key, incremental_key, compressed_key], dim=1), torch.cat([sink_value, incremental_value, compressed_value], dim=1)
         
         elif self.memory_type == MemoryType.DYNAMIC_INCREMENTAL:
             # memory在随着chunk数量的增加而变长，但是每次增长会刷新整个memory，而incremental memory只会在之前的基础上拼接新的memory
-            self.compressed_chunk_size = int(self.memory_size_limit // self.num_steps)
-            kwargs_of_compress_func['target_len'] = self.get_incremental_len(chunk_step, layer_idx, incremental_type=self.incremental_type)
+            kwargs_of_compress_func['target_len'] = self.memsize_scheduler.get_memsize(chunk_step, self.seq_len, layer_idx, keep_memory_rate=self.avg_memory_rate)
             if kwargs_of_compress_func['key'].shape[1] > kwargs_of_compress_func['target_len']:
                 compressed_key, compressed_value = compress_func(**kwargs_of_compress_func)
             else:
@@ -406,7 +373,7 @@ class TovaPruner(CollieModelForCausalLM):
         elif self.memory_type == MemoryType.DualMemory:
             self.compressed_chunk_size = self.memory_size_limit
             assert kwargs_of_compress_func['attention'] is not None
-            kwargs_of_compress_func['target_len'] = self.compressed_chunk_size # the compressed memory size is constant
+            kwargs_of_compress_func['target_len'] = self.memsize_scheduler.get_fix_memsize() # the compressed memory size is constant
             global_memory_size = int(kwargs_of_compress_func['target_len'] * 0.05)
             if self.cached_frequences[layer_idx] is not None:
                 global_memory_freqs, global_memory_indices = torch.topk(self.cached_frequences[layer_idx], dim=-1, k=global_memory_size)
@@ -438,8 +405,18 @@ class TovaPruner(CollieModelForCausalLM):
         """
         seq_len = input_ids.shape[1]
         if seq_len > 1:
-            chunked_input_ids = torch.split(input_ids, self.chunk_size, dim=1) # TODO: 支持长度无法被均分的情况
-            self.num_steps = len(chunked_input_ids)
+            if self.eval_len is not None:
+                seq_len = seq_len - self.eval_len
+            
+            if self.decremental_chunk and self.memory_type == MemoryType.DYNAMIC_INCREMENTAL:
+                chunk_sizes = self.chunksize_scheduler.get_decremental_chunk_sizes(seq_len, self.memsize_scheduler)
+            else:
+                chunk_sizes = self.chunksize_scheduler.get_std_chunk_sizes(seq_len)
+            
+            if self.eval_len is not None:
+                chunk_sizes += [self.eval_len]
+            chunked_input_ids = torch.split(input_ids, chunk_sizes, dim=1) # TODO: 支持长度无法被均分的情况
+            self.seq_len = seq_len
             # chunked_attention_mask = torch.split(attention_mask, self.chunk_size, dim=1)
             num_chunks = len(chunked_input_ids)
             
@@ -453,6 +430,9 @@ class TovaPruner(CollieModelForCausalLM):
                 model_outputs = self.model(chunked_input_ids[i], None, past_key_values=cached_compressed_kv)
  
                 kv_cache = model_outputs.past_key_values # kv_cache is list of tuple: [(key of layer0, value of layer0), ...]
+                if self.transpose_kv:
+                    kv_cache = [(kv[0].transpose(1, 2).contiguous(), kv[1].transpose(1, 2).contiguous()) for kv in kv_cache]
+                
                 attention_scores = model_outputs.attentions
 
                 keys, values = [kv[0].detach() for kv in kv_cache], [kv[1].detach() for kv in kv_cache]
@@ -460,7 +440,9 @@ class TovaPruner(CollieModelForCausalLM):
                     # print(chunked_input_ids[i].shape, flush=True)
                     compressed_keys, compressed_values = self.compress(keys=keys, values=values, attentions=attention_scores, chunk_step=i)
                     # assert compressed_keys.requires_grad and compressed_values.requires_grad
-                    cached_compressed_kv = [torch.stack([ck,cv], dim=0) for ck, cv in zip(compressed_keys, compressed_values)]# [num_layers, 2, bsz, seq_len, num_heads, head_dim]
+                    cached_compressed_kv = [(ck,cv) for ck, cv in zip(compressed_keys, compressed_values)]# [num_layers, 2, bsz, seq_len, num_heads, head_dim]
+                    if self.transpose_kv:
+                        cached_compressed_kv = [(kv[0].transpose(1, 2).contiguous(), kv[1].transpose(1, 2).contiguous()) for kv in cached_compressed_kv]
                 else: # local windows
                     cached_compressed_kv = None
                 # we need to detach output to free memory
@@ -469,6 +451,8 @@ class TovaPruner(CollieModelForCausalLM):
                 )
 
                 cached_llm_outpus.append(model_outputs) # drop the first rank, since the first chunk does not use compressed memory
+                # self.report_forgive_process(step=i)
+                # self.report_step_keep_memory_rate(step=i)
                 
             accum_logits = torch.cat([o.logits for o in cached_llm_outpus], dim=1) # batch_size, seq_len
             # TODO: accumulate hidden states
@@ -507,6 +491,8 @@ class TovaPruner(CollieModelForCausalLM):
 
     def clear_perceiver_cache(self):
         for i,ci in enumerate(self.cached_indices):
+            if ci is None:
+                continue
             if self.indices_counter[i] is None:
                 self.indices_counter[i] = Counter(ci.view(-1).tolist())
             else:
@@ -556,6 +542,8 @@ class TovaPruner(CollieModelForCausalLM):
             mem_perceiver.load_state_dict(state_dict)
         else:
             mem_perceiver = cls.from_config(config=config, model=model)
+        if 'internlm' in model_path_or_name.lower():
+            mem_perceiver.transpose_kv = True
         return mem_perceiver
 
 class StreamingLMPruner(TovaPruner):
@@ -634,7 +622,7 @@ class ROCOPruner(TovaPruner):
         important_scores = accum_attention_scores / normalization_scores.view(1, 1, -1).expand_as(accum_attention_scores)
         # v(x)=e(x^2)-e(x)^2
         std_scores = torch.sqrt(torch.sum(new_attention_scores**2) / normalization_scores - important_scores**2)
-        _, std_removed_indices = torch.topk(std_scores, k=target_len // 2, dim=-1, largest=False)
+        _, std_removed_indices = torch.topk(std_scores, k=target_len // 2, dim=-1, largest=False) # remove the 
         
         mask_for_important_scores = torch.zeros_like(important_scores).bool()
         assert not torch.any(mask_for_important_scores)
@@ -642,7 +630,7 @@ class ROCOPruner(TovaPruner):
             important_scores, 
             dim=-1, 
             index=std_removed_indices, 
-            src=torch.zeros_like(std_removed_indices).type_as(important_scores)) # mask the kv with low variance
+            src=torch.zeros_like(std_removed_indices).type_as(important_scores)) # mask the kv with lowest variance
 
         if survive_indices is not None:
             raise NotImplementedError
