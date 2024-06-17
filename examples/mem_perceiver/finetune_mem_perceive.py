@@ -27,21 +27,14 @@ from copy import deepcopy
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--pruner_type", type=str, choices=[
-                        PrunerType.CHUNK_PREFIX, PrunerType.H2O, PrunerType.LOCAL_WINDOW, PrunerType.NO_COMPRESS, 
-                        PrunerType.PERCEIVER, PrunerType.RANDOM, PrunerType.STREAMING, PrunerType.TOVA, None
-                    ], default=None)
+parser.add_argument("--pruner_type", type=str, default=None)
 parser.add_argument("--fuser_type", type=str, choices=['perceiver', 'llm', None], default=None)
 parser.add_argument("--do_train", action='store_true')
 parser.add_argument("--do_eval", action='store_true')
 parser.add_argument("--perceiver_path", type=str, default=None)
-parser.add_argument("--memory_type", type=str, choices=[
-                        MemoryType.CHUNK_STREAMING, MemoryType.DYNAMIC_INCREMENTAL, MemoryType.FIXED_INCREMENTAL,
-                        MemoryType.RETRIEVE_ALL_KV, MemoryType.RETRIEVE_INCREMENTAL,
-                        MemoryType.DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS
-                    ], default=None)
+parser.add_argument("--memory_type", type=str, default=None)
 parser.add_argument("--lr", type=float, default=1e-4)
-parser.add_argument("--llm_model", type=str, choices=["llama2_7b", "tiny_llama", "pangu2_6b", "internlm2_7b"], default="llama2")
+parser.add_argument("--llm_model", type=str, choices=["llama2_7b", "tiny_llama", "internlm2_7b"], default="llama2")
 parser.add_argument("--num_train_samples", type=int, default=None)
 parser.add_argument("--num_eval_samples", type=int, default=None)
 parser.add_argument("--chunk_size", type=int, default=None)
@@ -52,8 +45,15 @@ parser.add_argument("--use_flash", action='store_true', default=False)
 parser.add_argument("--num_gpus", type=int, default=1)
 parser.add_argument("--temperature", type=float, default=1.0)
 parser.add_argument("--eval_every", type=int, default=1000)
+parser.add_argument("--save_every", type=int, default=1000)
 parser.add_argument("--eval_len", type=int, default=16384)
 parser.add_argument("--train_epochs", type=int, default=1)
+parser.add_argument("--separate_compress", action='store_true')
+parser.add_argument("--memory_size_limit", type=int, default=None)
+parser.add_argument("--tag", type=str, default=None)
+parser.add_argument("--report_keep_memory_rate", action='store_true')
+parser.add_argument("--incremental_type", type=str, default='linear')
+parser.add_argument("--decremental_chunk", action='store_true')
 args = parser.parse_args()
 # 1. 设置路径
 # 1.1 预训练模型路径
@@ -85,11 +85,14 @@ config.use_flash = args.use_flash
 if args.pruner_type is not None:
     # tensorboard_dir = f"./ds_tb_logs/llm{args.llm_model}#pruner{args.pruner_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
     group=f"pruner_{args.pruner_type}"
-    tag = f"llm{args.llm_model}#pruner{args.pruner_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}"
+    tag = f"llm{args.llm_model}#pruner{args.pruner_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#eval_len{args.eval_len}#compressed_chunk{args.compressed_chunk_size}#memorysize{args.memory_size_limit}#incremental{args.incremental_type}"
 else:
     group=f"fuser_{args.fuser_type}"
     # tensorboard_dir = f"./ds_tb_logs/llm{args.llm_model}#fuser{args.fuser_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#temperature{args.temperature}"
-    tag = f"llm{args.llm_model}#fuser{args.fuser_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}"
+    tag = f"llm{args.llm_model}#fuser{args.fuser_type}#memory{args.memory_type}#lr{args.lr}#chunk{args.chunk_size}#eval_len{args.eval_len}#compressed_chunk{args.compressed_chunk_size}#memorysize{args.memory_size_limit}"
+    
+if args.tag is not None:
+    tag = f"{args.tag}#" + tag
 config.ds_config = {
         "bf16": {
             "enabled": True
@@ -97,12 +100,12 @@ config.ds_config = {
         "monitor_config": {
             "enabled": True,
             "tag": tag,  # job name
-            "wandb": {
-                "enabled": True,
-                "project": "kvcache-compress",
-                "team": "zyzeng",
-                "group": group,
-            },
+            # "wandb": {
+            #     "enabled": True,
+            #     "project": "kvcache-compress",
+            #     "team": "zyzeng",
+            #     "group": group,
+            # },
             "tensorboard": {
                 "enabled": True,
                 "output_path": "./ds_tb_logs/",
@@ -124,7 +127,6 @@ pe_config  = {'exp': False, '1d': False, 'imp': False, 'log': False,
           'pi_lambda': 1, 'base': 10000.0, 'ntk_option': 'dynamic', 'ntk_alpha': 1., }
 setattr(config.model_config, 'pe_config', pe_config)
 
-
 mem_perceiver_config = {
     "d_model": config.hidden_size // config.num_attention_heads * config.num_key_value_heads,
     "d_query": args.d_query,
@@ -135,7 +137,12 @@ mem_perceiver_config = {
     "num_layers": config.num_hidden_layers,
     "memory_type": args.memory_type,
     "num_sink_tokens": 4,
-    "temperature": args.temperature
+    "temperature": args.temperature,
+    # "separate_compress": args.separate_compress,
+    "memory_size_limit": args.memory_size_limit,
+    'incremental_type': args.incremental_type,
+    'eval_len': args.chunk_size,
+    "decremental_chunk": args.decremental_chunk
 }
 setattr(config, 'mem_perceiver_config', mem_perceiver_config) 
 
@@ -152,8 +159,7 @@ tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=Tr
 
 # 4. 加载数据集
 max_train_len = 8192
-eval_context_len = 0
-eval_predict_len = args.eval_len
+eval_len = args.eval_len
 if 'llama' in args.llm_model:
     # train_data_path = "/remote-home/share/personal/zyzeng/data/redpajama-15k-4k-llama/"
     # train_data_path = "/remote-home/share/personal/zyzeng/data/demo_1k/"
@@ -178,21 +184,18 @@ def prepare_train_dataset(samples, num_train_data, max_seq_len):
     ], shuffle=True)
     return dataset
 
-def prepare_eval_dataset(samples, num_eval_data, eval_context_len, eval_predict_len):
+def prepare_eval_dataset(samples, num_eval_data, max_seq_len):
     sub_samples = []
     for sample in samples:
         sample['labels'] = deepcopy(sample['input_ids'])
-        if eval_context_len > 0:
-            sample['labels'][:eval_context_len] = [-100 for _ in range(eval_context_len)]
-        assert len(sample['labels']) == len(sample['input_ids'])
         sub_samples.append(sample)
         if num_eval_data is not None and len(sub_samples) == num_eval_data:
             break
     dataset = CollieDatasetForTraining([
         {
-            'tokens': torch.tensor(sample['input_ids'])[:eval_context_len+eval_predict_len],
-            'labels': torch.tensor(sample['labels'])[:eval_context_len+eval_predict_len],
-            'attention_mask': torch.ones(len(sample['input_ids'])).long()[:eval_context_len+eval_predict_len],
+            'tokens': torch.tensor(sample['input_ids'])[:max_seq_len],
+            'labels': torch.tensor(sample['labels'])[:max_seq_len],
+            'attention_mask': torch.ones(len(sample['input_ids'])).long()[:max_seq_len],
         } for sample in sub_samples
     ])
     return dataset
@@ -205,11 +208,11 @@ else:
     train_dataset = []
 
 try:
-    github_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[0])['train'], args.num_eval_samples, eval_context_len, eval_predict_len)
-    arxiv_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[1])['train'], args.num_eval_samples, eval_context_len, eval_predict_len)
+    github_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[0])['train'], args.num_eval_samples, eval_len)
+    arxiv_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[1])['train'], args.num_eval_samples, eval_len)
 except Exception as e:
-    github_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[0]), args.num_eval_samples, eval_context_len, eval_predict_len)
-    arxiv_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[1]), args.num_eval_samples, eval_context_len, eval_predict_len)
+    github_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[0]), args.num_eval_samples, eval_len)
+    arxiv_eval_dataset = prepare_eval_dataset(datasets.load_from_disk(eval_data_paths[1]), args.num_eval_samples, eval_len)
     
 # print('example data: {}'.format(tokenizer.decode(train_dataset[0]['input_ids'])))
 print(f'training set size: {len(train_dataset)}, github eval set size: {len(github_eval_dataset)}, arxiv eval set size: {len(arxiv_eval_dataset)}')
@@ -232,8 +235,32 @@ monitors = [
     EvalMonitor(config)
 ]
 
+class LongGPTLMLoss(torch.nn.Module):
+    """最基本的 GPT 语言模型的损失函数。
+
+    :param ignore_index: 忽略的标签的 ``index``，默认为 **-100**
+    """
+    def __init__(self, ignore_index=-100, predict_len=512):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.loss = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)  # ignore <pad> when compute loss
+        self.predict_len = predict_len
+    
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor):
+        """ 计算损失
+        :param logits: 语言模型的输出
+        :param labels: 真实标签
+        """
+        shift_logits = logits[..., :-1, :].float().contiguous()
+        shift_labels = labels[..., 1:].contiguous().to(logits.device)
+        if shift_labels.shape[-1] > self.predict_len:
+            shift_labels[:, :-self.predict_len] = self.ignore_index
+        # Flatten the tokens
+        return self.loss(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
 # 8. 添加Evaluator
 github_evaluator_ppl = EvaluatorForPerplexity(
+    loss_fn=LongGPTLMLoss(-100, predict_len=args.chunk_size),
     model = model_for_training,
     config = config,
     dataset = github_eval_dataset,
@@ -245,6 +272,7 @@ github_evaluator_ppl = EvaluatorForPerplexity(
     }
 )
 arxiv_evaluator_ppl = EvaluatorForPerplexity(
+    loss_fn=LongGPTLMLoss(-100, predict_len=args.chunk_size),
     model = model_for_training,
     config = config,
     dataset = arxiv_eval_dataset,
@@ -265,7 +293,7 @@ else:
 if args.fuser_type != 'llm':
     callbacks = [
         CheckpointCallback(save_path,
-            every_n_batches=1000, # 每个 epoch 保存一次
+            every_n_batches=args.save_every, # 每个 epoch 保存一次
             every_n_epochs=1,
             model_only=False, # 仅保存模型权重，不保存optimzer、训练步数等断点重训信息
         )
@@ -274,7 +302,7 @@ else:
     callbacks=[
         CheckpointCallback(
             folder=save_path,
-            every_n_batches=1000, # 每个 epoch 保存一次
+            every_n_batches=args.save_every, # 每个 epoch 保存一次
             every_n_epochs=1,
             peft_only=True,
         )
@@ -298,5 +326,6 @@ if args.do_train:
 
 if args.do_eval:
     trainer.eval()
-
+    if args.report_keep_memory_rate:
+        model_for_training.report_avg_keep_memory_rate()
 #  Command CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --rdzv_backend=c10d --rdzv_endpoint=localhost:29402 --nnodes=1 --nproc_per_node=4 finetune_moss_for_training.py
