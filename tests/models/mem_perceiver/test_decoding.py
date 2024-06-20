@@ -74,7 +74,9 @@ def eval_speed(pruner_type, memory_type, chunk_size, memory_size_limit, input_le
             "num_sink_tokens": 4,
             "memory_size_limit": memory_size_limit,
             "incremental_type": incremental_type,
-            "decremental_chunk": decremental_chunk
+            "decremental_chunk": decremental_chunk,
+            "review_scheduler": "exp",
+            "review_times": 4,
         }
     # print(mem_perceiver_config)
     setattr(config, 'mem_perceiver_config', mem_perceiver_config) 
@@ -90,15 +92,15 @@ def eval_speed(pruner_type, memory_type, chunk_size, memory_size_limit, input_le
 
     input_ids = prepare_data_for_eval(datasets.load_from_disk(data_path)['train'], batch_size, input_len).cuda()
 
-    print('-'*30)
+    print('-'*100)
     print(f'chunk_size: {chunk_size} | memory size limit: {memory_size_limit} | \
           memory type: {memory_type} | pruner type: {pruner_type} | input {input_len} tokens | generate {generate_len} tokens'+'='*10, flush=True)
-    print('-'*30)
+    print('-'*100)
     
     gen_config = GenerationConfig(max_new_tokens=generate_len, min_new_tokens=generate_len, early_stopping=True, eos_token_id=2)
     model_outputs = mem_perceiver.generate(input_ids, generation_config=gen_config) # warmup GPU
     repeat_num = 1
-    mem_perceiver.report_avg_keep_memory_rate()
+    mem_perceiver.report_memory_state()
     with MeasureGPUTime(repeat_num,):
         for _ in range(repeat_num):
             model_outputs = mem_perceiver.generate(input_ids, generation_config=gen_config)
@@ -106,13 +108,13 @@ def eval_speed(pruner_type, memory_type, chunk_size, memory_size_limit, input_le
     print(torch.cuda.max_memory_allocated(torch.device("cuda:0")))
     torch.cuda.reset_max_memory_allocated(torch.device("cuda:0"))
 
-pruner_types = [PrunerType.CONV]
+pruner_types = [PrunerType.RANDOM]
 memory_types = [MemoryType.CHUNK_STREAMING]
 decremental_chunk = False
 incremental_types = ["linear"]
 chunk_sizes = [1024]
 memory_size_limits=[1024]
-input_lens = [16384]
+input_lens = [65536]
 generate_lens = [1]
 for it in incremental_types:
     for ms in memory_size_limits:
