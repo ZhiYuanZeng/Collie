@@ -1,4 +1,4 @@
-# AutoCompresser
+# AutoMemory
 将序列划分成多个chunk，并迭代压缩chunk。
 特点：
 - 将LLM和Compresser解耦，因此无需为模型定制Compresser，只要模型输出包含KV Cache，attention scores就能使用本框架
@@ -37,7 +37,7 @@ class PrunerType:
 - LOCAL_WINDOW
 - NO_COMPRESS
 
-Fuser:
+Fuser: (目前fuser的测试不成功)
 ```python
 class FuserType:
     PERCEIVER='perceiver'
@@ -51,7 +51,6 @@ class MemoryType:
     CHUNK_STREAMING="Chunk_Streaming" # Fixed-Size Memory
     FIXED_INCREMENTAL="Incremental_Chunk_Streaming_Fixed_History" # Incremental Fixed Memory
     DYNAMIC_INCREMENTAL="Incremental_Chunk_Streaming_Dynamic_History" # Incremental Dynamic Memory
-    DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS="dynamic_incremental_double_compress" # Incremental Dynamic Memory with Double Compression
 ```
 
 - CHUNK_STREAMING: 固定memory大小，每次压缩新的chunk更新Memory
@@ -63,6 +62,7 @@ class MemoryType:
 参考
 - pruner: `tests/models/mem_perceiver/test_decoding.py`
 - fuser: `tests/models/mem_perceiver/test_llm_fuser.py`
+
 ```python
 # 创建collie config
 config = CollieConfig.from_pretrained(llm_name_or_path,
@@ -105,3 +105,10 @@ mem_perceiver.generate(...)
 
 评测tova的ppl:
 `bash examples/mem_perceiver/finetune_tova_pruner.sh`
+
+## Memory Probing
+`collie/models/mem_perceiver/utils.py`定义了一些MemoryState，每个MemoryState对应一种Probing，例如MemoryForgive调查的是memory的遗忘曲线
+
+以`tests/models/mem_perceiver/test_forgiving.py`为例，调用model.report_memory_state()可以导出各种probing的状态。
+
+`tests/models/mem_perceiver/compare_forgiving.ipynb`可视化了memory的遗忘曲线
