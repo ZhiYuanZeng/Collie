@@ -17,12 +17,13 @@ from .utils import ChunkSizeScheduler, MemSizeScheduler, IncrementalType, Layerw
 from functools import partial
 from enum import Enum, unique
 from collie.module import GPTLMLoss
+import torch.nn.functional as F
 
 class MemoryType:
-    CHUNK_STREAMING="Chunk_Streaming"
+    CHUNK_STREAMING="FM"
     DualMemory="dual_memory"
     FIXED_INCREMENTAL="Incremental_Chunk_Streaming_Fixed_History"
-    DYNAMIC_INCREMENTAL="Incremental_Chunk_Streaming_Dynamic_History"
+    DYNAMIC_INCREMENTAL="IM"
     DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS="dynamic_incremental_double_compress"
     RETRIEVE_INCREMENTAL="Incremental_Chunk_Streaming_Retrieved_History"
     RETRIEVE_ALL_KV="Cache_All_KV_Retrieve_History"
@@ -38,6 +39,7 @@ class PrunerType:
     PERCEIVER="perceiver"
     ROCO="roco"
     CONV="conv"
+    all_pruners = [H2O, STREAMING, CHUNK_PREFIX, TOVA, RANDOM, LOCAL_WINDOW, NO_COMPRESS, PERCEIVER, ROCO, CONV]
 
 # class IncrementalType:
 #     LINEAR="linear"
@@ -50,12 +52,25 @@ class PrunerType:
 
 def build_llm_from_name_or_path(model_name_or_path, config):
     if 'llama' in model_name_or_path.lower():
+        pe_config  = {'exp': False, '1d': False, 'imp': False, 'log': False, 'exp_base': 4096, 'log_base': 4096, 'log_clip': 1, 'pi_lambda': 1,
+                      'max_length': config.max_position_embeddings, 'base': config.model_config.rope_theta, 'ntk_option': 'dynamic', 'ntk_alpha': 1., }
+        print(f'model: {model_name_or_path}, base: {pe_config["base"]}')
+        config.pe_config = pe_config
         model = LlamaForCausalLM.from_pretrained(model_name_or_path, config=config, trust_remote_code=True)
     elif 'internlm' in model_name_or_path.lower() or 'moss' in model_name_or_path.lower():
         model = InternLM2ForCausalLM.from_pretrained(model_name_or_path, config=config, trust_remote_code=True)
     else:
         raise NotImplementedError
     return model
+
+class AutoMemory:
+    @staticmethod
+    def from_pretrained(compresser_type, pretrained_model_name_or_path, config, perceiver_path=None):
+        if compresser_type in PrunerType.all_pruners:
+            return AutoPruner.from_pretrained(compresser_type, pretrained_model_name_or_path, config, perceiver_path=None)
+        elif compresser_type == 'share_kv':
+            config.share_kv = True
+            return build_llm_from_name_or_path(pretrained_model_name_or_path, config)
 
 class AutoPruner:
     @staticmethod
@@ -94,7 +109,7 @@ class AutoPruner:
         return pruner
 
 class TovaPruner(CollieModelForCausalLM):
-    def __init__(self, config, chunk_size, compressed_chunk_size=None, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, memory_size_limit=None, incremental_type='linear', eval_len=None, decremental_chunk=False, review_scheduler=None, review_times=0, **kwargs):
+    def __init__(self, config, chunk_size, compressed_chunk_size=None, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, memory_size_limit=None, incremental_type='linear', eval_len=None, decremental_chunk=False, review_scheduler=None, **kwargs):
         super().__init__(config)
         self.model = model
         self.chunk_size = chunk_size
@@ -114,14 +129,21 @@ class TovaPruner(CollieModelForCausalLM):
         self.eval_len = eval_len
         self.decremental_chunk = decremental_chunk
         self.transpose_kv = False
-        self.review_scheduler = review_scheduler
-        self.review_times = review_times
 
         assert memory_size_limit is not None
         self.incremental_type = incremental_type
         self.chunksize_scheduler = ChunkSizeScheduler(chunk_size)
         self.memsize_scheduler = MemSizeScheduler(chunk_size, max_mem_size=memory_size_limit, incremental_type=incremental_type, num_layers=num_layers)
-        self.review_scheduler = ReviewScheduler(scheduler=review_scheduler, review_times=review_times)
+
+        if review_scheduler is not None:
+            self.review_scheduler = ReviewScheduler(
+                scheduler=review_scheduler['scheduler'], 
+                review_times=review_scheduler['times'],
+                review_chunks=review_scheduler['length'],
+                chunk_id_to_review = math.ceil(self.memory_size_limit / self.chunk_size)
+            )
+        else:
+            self.review_scheduler = None
         self.memory_state = MemoryStateManager(num_layers, chunk_size, num_sink_tokens, self.review_scheduler)
         print('WARNING: The following kwargs are not used' + '!'* 20)
         print(kwargs)
@@ -283,7 +305,30 @@ class TovaPruner(CollieModelForCausalLM):
                 new_lst.append(first_chunk)
         return new_lst
 
-    def forward(self, input_ids: Any | None = None, attention_mask: Any | None = None, past_key_values: Tuple | None = None, **kwargs):
+    def estimate_loss(self, input_ids, logits, labels=None):
+        # 使用交叉熵损失函数计算损失
+        batch_size, sequence_length, vocab_size = logits.shape
+
+        # 将 input_ids 向左偏移一位，去掉第一个 token，最后一个 token 可以填充为 0 或者其他填充值
+        if labels is None:
+            shifed_labels = input_ids[:, 1:].contiguous()
+        else:
+            shifed_labels = labels[:, 1:].contiguous()
+
+        # 对 logits 进行相应的切片，去掉最后一个预测，因为它没有对应的标签
+        shifted_logits = logits[:, :-1, :].contiguous()
+
+        # 重新计算形状，以便于交叉熵损失的计算
+        shifted_logits = shifted_logits.view(-1, vocab_size)
+        shifed_labels = shifed_labels.view(-1)
+
+        # 使用交叉熵损失函数计算损失
+        loss = F.cross_entropy(shifted_logits, shifed_labels)
+
+        return loss
+        
+
+    def forward(self, input_ids: Any | None = None, attention_mask: Any | None = None, past_key_values: Tuple | None = None, labels = None, **kwargs):
         """
         split input_ids into chunks
         loop over chunks
@@ -312,8 +357,14 @@ class TovaPruner(CollieModelForCausalLM):
             
             if self.eval_len is not None:
                 chunk_sizes += [self.eval_len]
-            chunked_input_ids = torch.split(input_ids, chunk_sizes, dim=1) # TODO: 支持长度无法被均分的情况
-            chunked_input_ids = self.review_scheduler.review(list(chunked_input_ids)) # augment chunks by reviewing the first chunk
+            chunked_input_ids = torch.split(input_ids, chunk_sizes, dim=1)
+            if labels is not None:
+                chunked_labels = torch.split(labels, chunk_sizes, dim=1)
+            else:
+                chunked_labels = chunked_input_ids
+            if self.review_scheduler is not None:
+                chunked_input_ids = self.review_scheduler.review(list(chunked_input_ids)) # augment chunks by reviewing the first chunk
+                chunked_labels = self.review_scheduler.review(list(chunked_labels)) # augment chunks by reviewing the first chunk
             
             self.prefill_len = seq_len
             # chunked_attention_mask = torch.split(attention_mask, self.chunk_size, dim=1)
@@ -325,9 +376,10 @@ class TovaPruner(CollieModelForCausalLM):
             # compress the kv cache of prompt
             assert past_key_values is None
             cached_compressed_kv = None
+            losses = []
             for i in range(num_chunks):
                 model_outputs = self.model(chunked_input_ids[i], None, past_key_values=cached_compressed_kv)
- 
+                # compress kv cache and update memory
                 kv_cache = model_outputs.past_key_values # kv_cache is list of tuple: [(key of layer0, value of layer0), ...]
                 if self.transpose_kv:
                     kv_cache = [(kv[0].transpose(1, 2).contiguous(), kv[1].transpose(1, 2).contiguous()) for kv in kv_cache]
@@ -344,19 +396,25 @@ class TovaPruner(CollieModelForCausalLM):
                         cached_compressed_kv = [(kv[0].transpose(1, 2).contiguous(), kv[1].transpose(1, 2).contiguous()) for kv in cached_compressed_kv]
                 else: # local windows
                     cached_compressed_kv = None
-                # we need to detach output to free memory
                 model_outputs =CausalLMOutputWithPast(
                     logits=model_outputs.logits,
                 )
-
-                cached_llm_outpus.append(model_outputs) # drop the first rank, since the first chunk does not use compressed memory
-                
-            accum_logits = torch.cat([o.logits for o in cached_llm_outpus], dim=1) # batch_size, seq_len
+                loss = self.estimate_loss(chunked_input_ids[i], model_outputs.logits, chunked_labels[i])
+                # assert not torch.isnan(loss).any()
+                if not torch.isnan(loss).any():
+                    losses.append(loss.item())
+                else:
+                    losses.append(0) # zero loss will be ignored
+                # print(f'step: {i}, loss:{loss}')
+                # cached_llm_outpus.append(model_outputs) # drop the first rank, since the first chunk does not use compressed memory
+                cached_llm_outpus = model_outputs
+            # accum_logits = torch.cat([o.logits for o in cached_llm_outpus], dim=1) # batch_size, seq_len
+            accum_logits = cached_llm_outpus.logits
             # TODO: accumulate hidden states
             # print(f"hidden states shape: {cached_llm_outpus[0][0].shape}, {cached_llm_outpus[0][1].shape}, {cached_llm_outpus[0][2].shape}")
             # accum_hidden_states = torch.cat([o.hidden_states for o in cached_llm_outpus], dim=1) # batch_size, seq_len, d_model
             lm_output = CausalLMOutputWithPast(
-                loss=None,
+                loss=losses,
                 logits=accum_logits,
                 past_key_values=cached_compressed_kv,
                 hidden_states=None,
