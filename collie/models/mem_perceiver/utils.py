@@ -9,6 +9,15 @@ import matplotlib.pyplot as plt
 from collections import defaultdict, Counter
 import numpy as np
 
+llm_dict = {
+    'llama2-7b': "/remote-home/share/models/llama_v2_hf/7b/",
+    'llama2-13b': "/remote-home/share/models/llama_v2_hf/13b",
+    'internlm2-7b': "/remote-home/share/models/models--internlm2-7b/",
+    'internlm2-20b': "/remote-home/share/models/internlm2-20b-hf/",
+    "tiny_llama": "/remote-home/share/personal/zyzeng/models/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/",
+    "llama3-8b": "/remote-home/share/models/llama3_hf/Meta-Llama-3-8B"
+}
+
 def gradient_hook(grad, param_name="UnKnown"):
     print(f"Param_name: [{param_name}] Gradient: {grad}", flush=True)
 
@@ -197,7 +206,6 @@ class ChunkSizeScheduler:
         assert self.ref_chunk_size == mem_size_shechuler.chunk_size
         mem_sizes = [mem_size_shechuler.get_memsize(i, seq_len) for i in range(num_chunks)]
         avg_mem_size = sum(mem_sizes[:-1]) // (len(mem_sizes)-1)
-        avg_chunk_size = seq_len // num_chunks
         draft_chunk_sizes = [avg_chunk_size,] + [avg_chunk_size + avg_mem_size - mem_sizes[i-1] for i in range(1, num_chunks)]
         draft_chunk_sizes[-1] = seq_len-sum(draft_chunk_sizes[:-1])
         # print(mem_sizes, flush=True)
@@ -205,9 +213,11 @@ class ChunkSizeScheduler:
         return draft_chunk_sizes
 
 class ReviewScheduler():
-    def __init__(self, scheduler = None, review_times=0):
+    def __init__(self, scheduler = None, review_times=None, review_chunks=None, chunk_id_to_review=0):
         self.scheduler = scheduler
         self.review_times = review_times
+        self.review_chunks = review_chunks
+        self.chunk_id_to_review = chunk_id_to_review
     
     def repeat_first_chunk(self, lst, positions):
         first_chunk = lst[0]
@@ -219,19 +229,16 @@ class ReviewScheduler():
                 new_lst.append(first_chunk)
         return new_lst
 
-    def track_insert_positions(self, lst_length):
+    def track_insert_positions(self):
+        lst_length = self.review_chunks
         positions = self.get_review_positions(lst_length)
         insert_positions = []
         
         for i, pos in enumerate(sorted(positions)):
             actual_position = pos + i
-            if actual_position <= lst_length:
-                insert_positions.append(actual_position)
-            else:
-                insert_positions.append(lst_length - 1)
-        # print(f'{positions=}, {insert_positions=}, {lst_length=}', flush=True)
+            insert_positions.append(actual_position)
 
-        return insert_positions
+        return [self.chunk_id_to_review] + [self.chunk_id_to_review + p for p in insert_positions]
 
     @staticmethod
     def uniform_positions(lst_length, num_elements):
@@ -241,48 +248,60 @@ class ReviewScheduler():
         :param num_elements: 需要插入的元素数量
         :return: 插入位置的列表
         """
-        interval = lst_length / (num_elements + 1)
-        positions = [int(interval * (i + 1)) for i in range(num_elements)]
+        interval = lst_length / num_elements
+        positions = [int(interval * (i+1))-1 for i in range(num_elements)]
     
         return positions
 
     @staticmethod
     def exp_positions(lst_length, num_elements):
-        """
-        确定插入点之间的间隔/插入点和开始结尾的间隔呈指数增长的位置
-        :param lst_length: 原始列表的长度
-        :param num_elements: 需要插入的元素数量
-        :return: 插入位置的列表
-        """
-        # 确定指数增长的基数
-        base = np.exp(np.log(lst_length - 1) / num_elements)
-
-        positions = [0] * num_elements
-        for i in range(num_elements):
-            positions[i] = int(base ** (i + 1))
-            if positions[i] >= lst_length:
-                positions[i] = lst_length - 1
+        # 计算指数基数
+        base = (lst_length - 1) ** (1 / (num_elements - 1))
         
-        # 去除重复和超出范围的插入点
+        # 计算插入位置
+        positions = [int(round(base ** i)) for i in range(num_elements)]
+        
+        # 确保最后一个位置在序列末尾
+        positions[-1] = lst_length - 1
+        
+        # 去重并排序
         positions = sorted(set(positions))
         
         return positions
     
+    @staticmethod
+    def early_positions(lst_length, num_elements):
+        return [0 for i in range(num_elements)]
+    
+    @staticmethod
+    def late_positions(lst_length, num_elements):
+        return [lst_length for i in range(num_elements)]
+    
     def get_review_positions(self, num_chunks):
+        if self.scheduler is None:
+            return []
         assert self.review_times > 0 or num_chunks > self.review_times
 
         if self.scheduler == 'uniform':
             return ReviewScheduler.uniform_positions(num_chunks, self.review_times)
         elif self.scheduler == 'exp':
             return ReviewScheduler.exp_positions(num_chunks, self.review_times)
+        elif self.scheduler == 'early':
+            return ReviewScheduler.early_positions(num_chunks, self.review_times)
+        elif self.scheduler == 'late':
+            return ReviewScheduler.late_positions(num_chunks, self.review_times)
         else:
             raise NotImplementedError
 
     def review(self, chunks):
         if self.review_times == 0 or self.scheduler is None:
             return chunks
-        positions = self.get_review_positions(len(chunks))
-        new_chunks = self.repeat_first_chunk(chunks, positions)
+        prefix_chunks, review_chunks, post_chunks = chunks[:self.chunk_id_to_review], chunks[self.chunk_id_to_review: self.chunk_id_to_review+self.review_chunks], chunks[self.chunk_id_to_review+self.review_chunks:]
+        positions = self.get_review_positions(len(review_chunks))
+        print(f"chunk_id_to_review: {self.chunk_id_to_review}, review positions: {[p+self.chunk_id_to_review for p in positions]}")
+
+        new_prefix_chunks = self.repeat_first_chunk(review_chunks, positions)
+        new_chunks = prefix_chunks + new_prefix_chunks + post_chunks
         print("before review, the number of chunks: {} => {}".format(len(chunks), len(new_chunks)))
         return new_chunks
 
@@ -293,7 +312,7 @@ class MemoryStateManager():
         self.num_layers = num_layers
         self.states = {
             'memory_rention': MemoryRention(chunk_size),
-            'memory_distrbution': MemoryDistribution(chunk_size),
+            # 'memory_distrbution': MemoryDistribution(chunk_size),
             'memory_forgive': MemoryForgive(chunk_size, review_scheduler),
             'memory_usage': MemoryUsage(chunk_size)
         }
@@ -332,8 +351,17 @@ class MemoryStateManager():
     def report_state(self):
         for k, state in self.states.items():
             num_placehold = 20
-            print('#'* num_placehold + 'memory retention ratio' + '#'*num_placehold)
+            print('#'* num_placehold + f' {k} ' + '#'*num_placehold)
             state.report()
+        print('#'* num_placehold + ' {memory token indices} ' + '#'*num_placehold)
+        memory_indices = torch.stack(self.memory_indices, dim=0)
+        mi_set = torch.unique(memory_indices.view(-1))
+        print('number of non-repeat elements in memory indices: {}'.format(len(mi_set)))
+        print(mi_set.tolist())
+        mi_set = mi_set // self.chunk_size
+        memory_distribution = Counter(mi_set.tolist())
+        sorted_memory_distribution = sorted(memory_distribution.items(), key=lambda x: x[0], reverse=True)
+        print(f'memory distribution across each chunk: {sorted_memory_distribution}')
 
     def clear_state(self):
         raise NotImplementedError        
@@ -375,12 +403,11 @@ class MemoryRention(MemoryState):
     def update(self, memory_indices, seq_len, prefill_len, topk_indices, chunk_step, layer_idx, attention_scores):
         if memory_indices is None:
             return
-        else:
-            mem_size = memory_indices.shape[-1]
-            temp_retention_ratio = torch.sum(topk_indices < mem_size) / torch.numel(topk_indices)
-            temp_retention_ratio = temp_retention_ratio.item()
-            self._update_move_avg(self.states, f'{layer_idx=}', temp_retention_ratio) # average on setp
-            self._update_move_avg(self.states, f'{chunk_step=}', temp_retention_ratio) # average on layer                              
+        mem_size = memory_indices.shape[-1]
+        temp_retention_ratio = torch.sum(topk_indices < mem_size) / torch.numel(topk_indices)
+        temp_retention_ratio = temp_retention_ratio.item()
+        self._update_move_avg(self.states, f'{layer_idx=}', temp_retention_ratio) # average on setp
+        self._update_move_avg(self.states, f'{chunk_step=}', temp_retention_ratio) # average on layer                              
 
     def report(self):
         layer_memory_retention_ratio = {}
@@ -396,12 +423,9 @@ class MemoryRention(MemoryState):
 
 class MemoryUsage(MemoryState):
     def update(self, memory_indices, seq_len, prefill_len, topk_indices, chunk_step, layer_idx, attention_scores):
-        if memory_indices is None:
+        if memory_indices is None or attention_scores is None:
             return
         memory_size = memory_indices.shape[-1]
-        # attention shape: bsz, num_heads, seq_len, seq_len
-        if attention_scores is None:
-            return
         chunk_size = seq_len - memory_size
         valid_attention_scores = attention_scores[:, :, -chunk_size:]
         avg_attention_scores = valid_attention_scores.mean(dim=2) # (bsz, num_heads, seq_len)
@@ -431,24 +455,27 @@ class MemoryForgive(MemoryState):
         self.review_scheduler = review_scheduler
 
     def update(self, memory_indices, seq_len, prefill_len, topk_indices, chunk_step, layer_idx, attention_scores):
-        if memory_indices is not None:
-            # report the number of kv of the first chunk remained in the memory while iteration
-            num_chunks = self._get_num_chunks(prefill_len)
-            review_positions = self.review_scheduler.track_insert_positions(num_chunks)
-            review_positions = [0,] + review_positions
-            # print(f'{review_positions=}', flush=True)
-            # print(torch.unique(memory_indices // self.chunk_size))
-            # print(review_positions)
-            is_kv_from_first_chunk = torch.isin(memory_indices // self.chunk_size, torch.tensor(review_positions).type_as(memory_indices))
-            
-            first_chunk_keep_rate = is_kv_from_first_chunk.float().mean()
-            self._update_move_avg(self.states, k=f'{chunk_step=}', v=first_chunk_keep_rate.item())
+        if memory_indices is None:
+            return
+        if self.review_scheduler is not None:
+            review_positions = self.review_scheduler.track_insert_positions()
+        else:
+            review_positions = [0]
+
+        # # review_positions are chunk IDs, while memory indices are token IDs
+        is_kv_from_first_chunk = torch.isin(memory_indices // self.chunk_size, torch.tensor(review_positions).type_as(memory_indices))
+
+        # first_chunk_keep_rate = is_kv_from_first_chunk.float().mean() / memory_size
+        first_chunk_keep_rate = is_kv_from_first_chunk.float().mean()
+        self._update_move_avg(self.states, k=f'{chunk_step=}', v=first_chunk_keep_rate.item())
     
     def report(self):
         print('forgive ratio of first chunks and review chunks:', self.extract_output(self.states))
 
 class MemoryDistribution(MemoryState):
     def update(self, memory_indices, seq_len, prefill_len, topk_indices, chunk_step, layer_idx, attention_scores):
+        if memory_indices is None:
+            return
         layer_key = f'layer_{layer_idx}'
         step_key = f'step_{chunk_step}'
         num_chunks = self._get_num_chunks(prefill_len)
