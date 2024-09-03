@@ -102,7 +102,7 @@ class AutoPruner:
         elif pruner_type == PrunerType.PERCEIVER:
             pruner = PerceiverPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"the {pruner_type} is not supported")
         if pruner_type in (PrunerType.H2O):
             assert config.mem_perceiver_config['memory_type'] in (MemoryType.CHUNK_STREAMING, MemoryType.DYNAMIC_INCREMENTAL)
 
@@ -328,7 +328,7 @@ class TovaPruner(CollieModelForCausalLM):
         return loss
         
 
-    def forward(self, input_ids: Any | None = None, attention_mask: Any | None = None, past_key_values: Tuple | None = None, labels = None, **kwargs):
+    def forward(self, input_ids: Any | None = None, attention_mask: Any | None = None, past_key_values: Tuple | None = None, labels = None, update_memory=True, **kwargs):
         """
         split input_ids into chunks
         loop over chunks
@@ -374,8 +374,7 @@ class TovaPruner(CollieModelForCausalLM):
 
             # print("compress prompt...", flush=True)
             # compress the kv cache of prompt
-            assert past_key_values is None
-            cached_compressed_kv = None
+            cached_compressed_kv = past_key_values
             losses = []
             for i in range(num_chunks):
                 model_outputs = self.model(chunked_input_ids[i], None, past_key_values=cached_compressed_kv)
@@ -387,15 +386,14 @@ class TovaPruner(CollieModelForCausalLM):
                 attention_scores = model_outputs.attentions
 
                 keys, values = [kv[0].detach() for kv in kv_cache], [kv[1].detach() for kv in kv_cache]
-                if self.memory_size_limit != 0:
+                if self.memory_size_limit != 0 and update_memory:
                     # print(chunked_input_ids[i].shape, flush=True)
                     compressed_keys, compressed_values = self.compress(keys=keys, values=values, attentions=attention_scores, chunk_step=i)
                     # assert compressed_keys.requires_grad and compressed_values.requires_grad
                     cached_compressed_kv = [(ck,cv) for ck, cv in zip(compressed_keys, compressed_values)]# [num_layers, 2, bsz, seq_len, num_heads, head_dim]
                     if self.transpose_kv:
                         cached_compressed_kv = [(kv[0].transpose(1, 2).contiguous(), kv[1].transpose(1, 2).contiguous()) for kv in cached_compressed_kv]
-                else: # local windows
-                    cached_compressed_kv = None
+                
                 model_outputs =CausalLMOutputWithPast(
                     logits=model_outputs.logits,
                 )
