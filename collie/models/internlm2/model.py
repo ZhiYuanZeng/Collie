@@ -698,21 +698,6 @@ class InternLM2DecoderLayer(nn.Module):
 
             position_ids = position_ids.unsqueeze(0)
 
-        # we need to overide the original attention_mask to support layerwise incremental memory
-        if self.config.attn_implementation == "flash_attention_2" or self.config.use_flash:
-            # 2d mask is passed through the layers
-            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        else:
-            past_key_values_length = 0
-            if past_key_value is not None:
-                # print(f'{len(past_key_value)=}, {len(past_key_value[0])=}', flush=True)
-                past_key_values_length = past_key_value[0][0].shape[1]
-            attention_mask = torch.ones(
-                (hidden_states.shape[0], hidden_states.shape[1] + past_key_values_length), dtype=torch.bool, device=hidden_states.device
-            )
-            attention_mask = self._prepare_decoder_attention_mask(
-                attention_mask, (hidden_states.shape[0], seq_length), hidden_states, past_key_values_length
-        )
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.attention(
             hidden_states=hidden_states,
@@ -979,12 +964,12 @@ class InternLM2Model(nn.Module):
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
-        # if position_ids is None:
-        #     device = input_ids.device if input_ids is not None else inputs_embeds.device
-        #     position_ids = torch.arange(
-        #         seq_length + past_key_values_length, dtype=torch.long, device=device
-        #     )
-        #     position_ids = position_ids.unsqueeze(0)
+        if position_ids is None:
+            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            position_ids = torch.arange(
+                seq_length + past_key_values_length, dtype=torch.long, device=device
+            )
+            position_ids = position_ids.unsqueeze(0)
         if inputs_embeds is None:
             inputs_embeds = self.tok_embeddings(input_ids)
 
