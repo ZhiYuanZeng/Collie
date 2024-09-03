@@ -35,6 +35,7 @@ from collie.module import (
 )
 from collie.utils import concat_tensor, dict_as_params, env, progress
 import numpy as np
+from torch.nn.parameter import Parameter
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -314,11 +315,7 @@ class LlamaLayer(nn.Module):
                 start_pos = layer_past[0].shape[1]
         else:
             start_pos = 0
-        if self.num_key_value_groups > 1:
-            key = torch.repeat_interleave(key, dim=2, repeats=self.num_key_value_groups)
-            value = torch.repeat_interleave(
-                value, dim=2, repeats=self.num_key_value_groups
-            )
+        
         if layer_past is not None:
             # past_key: batch_size, num_heads, seq_len, head_dim
             if self.config.peft_config and self.config.peft_config.peft_type == "PREFIX_TUNING":
@@ -328,7 +325,7 @@ class LlamaLayer(nn.Module):
                 past_value = layer_past[1].permute([0, 2, 1, 3])
             else:
                 past_key, past_value = layer_past
-            query = torch.cat([past_key, query], dim=1)
+
             key = torch.cat([past_key, key], dim=1)
             value = torch.cat([past_value, value], dim=1)
 
@@ -343,6 +340,16 @@ class LlamaLayer(nn.Module):
                 new_layer_past = (present_key, present_value)
             else:
                 new_layer_past = (key, value)
+        
+        if self.num_key_value_groups > 1:
+            key = torch.repeat_interleave(key, dim=2, repeats=self.num_key_value_groups)
+            value = torch.repeat_interleave(
+                value, dim=2, repeats=self.num_key_value_groups
+            )
+        if layer_past is not None:
+            query = torch.nn.functional.pad(query, (0, 0, 0, 0, past_key.shape[1], 0))
+            assert query.shape == key.shape
+
         positions = torch.arange(query.shape[1], device=query.device)
         # if layer_past is not None:
         #     previous_key_len = past_key.shape[1]
