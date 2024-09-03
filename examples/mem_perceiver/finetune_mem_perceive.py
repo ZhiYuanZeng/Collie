@@ -12,7 +12,7 @@ from collie.controller.trainer import Trainer
 from collie.controller.evaluator import EvaluatorForPerplexity, EvaluatorForGeneration
 
 from collie.models import LlamaForCausalLM
-from collie.models.mem_perceiver import MemPerceiver, ParallelMemPerceiver, AutoPruner, AutoFuser, PrunerType, MemoryType, PrunerLoss
+from collie.models.mem_perceiver import AutoPruner, AutoFuser, PrunerType, MemoryType, PrunerLoss
 
 from collie.utils.monitor import StepTimeMonitor, TGSMonitor, MemoryMonitor, LossMonitor, EvalMonitor, get_monitor
 from collie.metrics import DecodeMetric, PPLMetric
@@ -137,11 +137,9 @@ mem_perceiver_config = {
     "num_layers": config.num_hidden_layers,
     "memory_type": args.memory_type,
     "num_sink_tokens": 4,
-    "temperature": args.temperature,
     # "separate_compress": args.separate_compress,
     "memory_size_limit": args.memory_size_limit,
     'incremental_type': args.incremental_type,
-    'eval_len': args.chunk_size,
     "decremental_chunk": args.decremental_chunk
 }
 setattr(config, 'mem_perceiver_config', mem_perceiver_config) 
@@ -235,32 +233,9 @@ monitors = [
     EvalMonitor(config)
 ]
 
-class LongGPTLMLoss(torch.nn.Module):
-    """最基本的 GPT 语言模型的损失函数。
-
-    :param ignore_index: 忽略的标签的 ``index``，默认为 **-100**
-    """
-    def __init__(self, ignore_index=-100, predict_len=512):
-        super().__init__()
-        self.ignore_index = ignore_index
-        self.loss = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)  # ignore <pad> when compute loss
-        self.predict_len = predict_len
-    
-    def forward(self, logits: torch.Tensor, labels: torch.Tensor):
-        """ 计算损失
-        :param logits: 语言模型的输出
-        :param labels: 真实标签
-        """
-        shift_logits = logits[..., :-1, :].float().contiguous()
-        shift_labels = labels[..., 1:].contiguous().to(logits.device)
-        if shift_labels.shape[-1] > self.predict_len:
-            shift_labels[:, :-self.predict_len] = self.ignore_index
-        # Flatten the tokens
-        return self.loss(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
 # 8. 添加Evaluator
 github_evaluator_ppl = EvaluatorForPerplexity(
-    loss_fn=LongGPTLMLoss(-100, predict_len=args.chunk_size),
+    loss_fn=GPTLMLoss(-100),
     model = model_for_training,
     config = config,
     dataset = github_eval_dataset,
@@ -272,7 +247,7 @@ github_evaluator_ppl = EvaluatorForPerplexity(
     }
 )
 arxiv_evaluator_ppl = EvaluatorForPerplexity(
-    loss_fn=LongGPTLMLoss(-100, predict_len=args.chunk_size),
+    loss_fn=GPTLMLoss(-100),
     model = model_for_training,
     config = config,
     dataset = arxiv_eval_dataset,
