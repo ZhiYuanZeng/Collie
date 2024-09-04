@@ -18,6 +18,8 @@ class Template:
     def get_template(cls, model_name, tokenizer):
         if model_name == 'llama3-1':
             return Llama3_1Template(tokenizer)
+        elif model_name == 'llama2':
+            return Llama2Template(tokenizer)
         elif model_name == 'falcon-mamba':
             return MambaTemplate(tokenizer)
         elif model_name == 'recurrent-gemma':
@@ -39,6 +41,25 @@ class Llama3_1Template():
         indices = extract_span_indices(input_ids, start_tag=self.tokenizer.encode(self.start_header)[0], end_tag=self.tokenizer.encode(self.end_token)[0])
         return indices[1::2]
 
+class  Llama2Template():
+    def __init__(self, tokenizer):
+        self.start_question_token = '[INST]'
+        self.end_question_token = '[/INST]'
+        self.start_conversation_token = '<s>'
+        self.end_conversation_token = '</s>'
+        self.tokenizer = tokenizer
+    
+    def apply(self, question, answer):
+        question = self.start_conversation_token + self.start_question_token + question + self.end_question_token
+        answer = answer + self.end_conversation_token
+        return question + answer
+
+    def get_answer_indices(self, input_ids):
+        print(input_ids[:1000])
+        print(self.tokenizer.encode(self.end_question_token)[1:], self.tokenizer.encode(self.end_conversation_token)[1:])
+        indices = extract_span_indices(input_ids, start_tags=self.tokenizer.encode(self.end_question_token)[1:], end_tags=self.tokenizer.encode(self.end_conversation_token)[1:])
+        return indices
+ 
 class MambaTemplate():
     def __init__(self, tokenizer):
         self.start_token = '<|im_start|>'
