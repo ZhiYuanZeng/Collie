@@ -86,12 +86,14 @@ class Dataset():
     def get_dataset(cls, model_name, train_datasize, eval_datasize, num_epochs, data_path=None, data_name=None, template_name=None, seed=None):
         if data_name == 'MTOB':
             return MTOBDataset(model_name, train_datasize, eval_datasize, num_epochs, data_path, data_name, seed)
-        elif data_name == 'Zhihu':
-            return ZhihuDataset(model_name, train_datasize, eval_datasize, num_epochs, data_path, data_name, seed)
         elif data_name == 'OpenOrca':
             return OpenOrcaDataset(model_name, train_datasize, eval_datasize, num_epochs, data_path, data_name, template_name, seed)
-        elif data_name == 'GSM8k':
-            return GSM8kDataset(model_name, train_datasize, eval_datasize, num_epochs, data_path, data_name, template_name, seed)
+        elif data_name == 'MetaMath':
+            return MetaMathDataset(model_name, train_datasize, eval_datasize, num_epochs, data_path, data_name, template_name, seed)
+        elif data_name == 'MagiCoder':
+            return MagiCoderDataset(model_name, train_datasize, eval_datasize, num_epochs, data_path, data_name, template_name, seed)
+        elif data_name == 'OpenHermos':
+            return OpenHermos(model_name, train_datasize, eval_datasize, num_epochs, data_path, data_name, template_name, seed)
         else:
             raise NotImplementedError
         
@@ -204,15 +206,15 @@ class MTOBDataset(PretrainDataset):
         # print('num tokens of MTOB:', len(self.tokenizer.encode(text)))
         return text[:max_length]
 
-class ZhihuDataset(PretrainDataset):
+class OpenOrcaDataset(SFTDataset):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self.data_path is None:
-            self.data_path = "/remote-home/zyzeng/LLM-Shearing/LLM-Shearing/data_raw/moss_data_split/cn_zhihu/aa.jsonl"
-        self.data_name = 'Zhihu'
-    
-    def read_raw_data(self, max_length=1024 * 1024 * 8):
-        all_data = []
+            self.data_path = "/remote-home1/zyzeng/data/openorca.jsonl"
+        self.data_name = 'OpenOrca'
+
+    def read_raw_data(self, max_length=1024 * 1024 * 64):
+        all_qa = []
         char_count = 0
         with open(self.data_path, 'r') as f:
             for l in f:
@@ -226,47 +228,75 @@ class ZhihuDataset(PretrainDataset):
 
                 if char_count >= max_length:
                     break
-        return '\n\n'.join(all_data)
+        return all_qa
 
-class OpenOrcaDataset(SFTDataset):
+class MetaMathDataset(SFTDataset):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self.data_path is None:
-            self.data_path = "/remote-home/zyzeng/data/openorca.jsonl"
+            self.data_path = "/remote-home1/zyzeng/data/metamath/MetaMathQA-395K.json"
         self.data_name = 'OpenOrca'
 
     def read_raw_data(self, max_length=1024 * 1024 * 64):
         all_qa = []
         char_count = 0
         with open(self.data_path, 'r') as f:
-            for l in f:
-                d = json.loads(l)
-                qa = self.template.apply(d['question'], d['response'])
-                if len(qa) > 1024 * 4:
+            examples = json.load(f)
+            for e in examples:
+                qa = self.template.apply(e['query'], e['response'])
+
+                if len(qa['question'] + qa['answer']) > 1024 * 4:
                     continue
 
                 all_qa.append(qa)
-                char_count += len(qa)
+                char_count += len(qa['question'] + qa['answer'])
 
                 if char_count >= max_length:
                     break
         return all_qa
 
-class GSM8kDataset(SFTDataset):
+class MagiCoderDataset(SFTDataset):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self.data_path is None:
-            self.data_path = "/remote-home/zyzeng/gsm_8k.jsonl"
-        self.data_name = 'gsm-8k'
+            self.data_path = "/remote-home1/zyzeng/data/magicoder/data-evol_instruct-decontaminated.jsonl"
+        self.data_name = 'MagiCorder'
     
-    def read_raw_data(self, max_length=1024 * 1024 * 8):
+    def read_raw_data(self, max_length=1024 * 1024 * 64):
         all_qa = []
         char_count = 0
         with open(self.data_path, 'r') as f:
             for l in f:
                 d = json.loads(l)
-                qa = self.template.apply(d['question'], d['answer'])
-                if len(qa) > 1024 * 4:
+                qa = self.template.apply(d['instruction'], d['response'])
+                if len(qa['question'] + qa['answer']) > 1024 * 4:
+                    continue
+
+                all_qa.append(qa)
+                char_count += len(qa['question'] + qa['answer'])
+
+                if char_count >= max_length:
+                    break
+        return all_qa
+
+class OpenHermos(SFTDataset):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.data_path is None:
+            self.data_path = "/remote-home1/zyzeng/data/openhermes/openhermes2_5.json"
+        self.data_name = 'MagiCorder'
+    
+    def read_raw_data(self, max_length=1024 * 1024 * 64):
+        all_qa = []
+        char_count = 0
+        with open(self.data_path, 'r') as f:
+            examples = json.load(f)
+            for e in examples:
+                question = e['conversations'][0]['value']
+                answer = e['conversations'][1]['value']
+                qa = self.template.apply(question, answer)
+
+                if len(qa['question'] + qa['answer']) > 1024 * 4:
                     continue
 
                 all_qa.append(qa)
