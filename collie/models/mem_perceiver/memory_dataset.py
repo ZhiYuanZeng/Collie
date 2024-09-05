@@ -31,13 +31,9 @@ class Llama3_1Template():
         self.tokenizer = tokenizer
     
     def apply(self, question, answer):
-        question = self.start_header + 'user' + self.end_header + '\n\n' + question + self.end_token
-        answer = self.start_header + 'assistant' + self.end_header + '\n\n' + answer + self.end_token
-        return question + answer
-
-    def get_answer_indices(self, input_ids):
-        indices = extract_span_indices(input_ids, start_tag=self.tokenizer.encode(self.start_header)[0], end_tag=self.tokenizer.encode(self.end_token)[0])
-        return indices[1::2]
+        question = self.start_header + 'user' + self.end_header + '\n' + question + self.end_token + '\n\n'
+        answer = self.start_header + 'assistant' + self.end_header + '\n' + answer + self.end_token + '\n\n'
+        return {'question': question, 'answer': answer}
 
 class  Llama2Template():
     def __init__(self, tokenizer):
@@ -48,15 +44,10 @@ class  Llama2Template():
         self.tokenizer = tokenizer
     
     def apply(self, question, answer):
-        question = self.start_conversation_token + self.start_question_token + question + self.end_question_token
-        answer = answer + self.end_conversation_token
-        return question + answer
+        question = self.start_question_token + 'user: ' + question + self.end_question_token + '\n\n'
+        answer = answer + '\n\n'
+        return {'question': question, 'answer': answer}
 
-    def get_answer_indices(self, input_ids):
-        print(input_ids[:1000])
-        print(self.tokenizer.encode(self.end_question_token)[1:], self.tokenizer.encode(self.end_conversation_token)[1:])
-        indices = extract_span_indices(input_ids, start_tags=self.tokenizer.encode(self.end_question_token)[1:], end_tags=self.tokenizer.encode(self.end_conversation_token)[1:])
-        return indices
  
 class MambaTemplate():
     def __init__(self, tokenizer):
@@ -65,11 +56,10 @@ class MambaTemplate():
         self.tokenizer = tokenizer
 
     def apply(self, question, answer):
-        return 'user: ' + question + '\n' + self.start_token + 'assistant: ' + answer + self.end_token
+        question = 'user: ' + question + '\n\n' + self.start_token
+        answer = 'assistant: ' + answer + self.end_token
+        return {'question': question, 'answer': answer}
     
-    def get_answer_indices(self, input_ids):
-        return extract_span_indices(input_ids, start_tags=self.tokenizer.encode(self.start_token), end_tags=self.tokenizer.encode(self.end_token))
-
 class Dataset():
     def __init__(self, model_name, train_datasize, eval_datasize, num_epochs, data_path=None, data_name=None, seed=None):
         self.model_name = model_name
@@ -81,9 +71,7 @@ class Dataset():
         hf_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         parallel_tokenizer = ParallelTokenizer(
             tokenizer=hf_tokenizer,
-            num_processes=64,
-            overlap_length=128,
-            concat_keys=["input_ids", "attention_mask"],
+            num_processes=128,
         )
         self.tokenizer = parallel_tokenizer
         self.seed = seed
@@ -140,32 +128,58 @@ class PretrainDataset(Dataset):
 class SFTDataset(Dataset):
     def __init__(self, model_name, train_datasize, eval_datasize, num_epochs, data_path=None, data_name=None, template_name=None, seed=None):
         super().__init__(model_name, train_datasize, eval_datasize, num_epochs, data_path, data_name, seed)
-        self.template = Template.get_template(template_name, self.tokenizer)
+        self.template = Template.get_template(template_name, self.tokenizer)        
 
-    def load_data(self, concat_train_eval=True):
-        all_qa = []
+    def merge_and_track_indices(self, list1, list2):
+        # 先将两个列表的元素拼接
+        merged = [a + b for a, b in zip(list1, list2)]
         
+        # 展平拼接后的列表
+        flattened = [item for sublist in merged for item in sublist]
+        
+        # 记录元素来自哪个列表，0表示来自list1，1表示来自list2
+        indices = []
+        for i, (a, b) in enumerate(zip(list1, list2)):
+            indices.extend([0] * len(a))  # list1的元素
+            indices.extend([1] * len(b))  # list2的元素
+        
+        return flattened, indices
+
+    def load_data(self, concat_train_eval=True):        
         all_qa = self.read_raw_data() 
         random.seed(self.seed)
         random.shuffle(all_qa)
-        all_qa = '\n\n'.join(all_qa)
-        input_ids = self.tokenizer.encode(all_qa)
-        print('finish tokenizing')
-        response_indices = self.template.get_answer_indices(input_ids)
+        
+        print('start tokenizing....')
+        avg_question_length = sum([len(qa['question']) for qa in all_qa]) / (len(all_qa))
+        avg_answer_length = sum([len(qa['answer']) for qa in all_qa]) / (len(all_qa))
+
+        print(f'avg question length: {avg_question_length}, average answer length: {avg_answer_length}')
+        tokenized_all_q = self.tokenizer.parallel_encode([qa['question'] for qa in all_qa])['input_ids']
+        tokenized_all_a = self.tokenizer.parallel_encode([qa['answer'] for qa in all_qa])['input_ids']
+        input_ids, label_mask = self.merge_and_track_indices(tokenized_all_q, tokenized_all_a)
+        
         input_ids = torch.tensor(input_ids)
-        labels = torch.tensor([-100 for _ in range(len(input_ids))])
-        for indices in response_indices:
-            labels[indices[0]:indices[1]+1] = input_ids[indices[0]:indices[1]+1]
-            # print(self.tokenizer.decode(labels[indices[0]:indices[1]+1]))
-            # print('-'*50)
-        # print(tokenizer.decode(input_ids))
+        label_mask = torch.tensor(label_mask).bool()
+        labels = torch.full_like(input_ids, -100)
+        labels[label_mask] = input_ids[label_mask]
+
+        print('finish tokenizing....')
+        print('inputs example:' + '#' * 60)
+        print(self.tokenizer.decode(input_ids[:1000]))
+        print('#' * 60)
+        print('labels example:' + '#' * 60)
+        print(self.tokenizer.decode(labels[label_mask][:1000]))
+        print('#' * 60)
 
         train_input_ids = input_ids[self.eval_datasize : self.train_datasize + self.eval_datasize].unsqueeze(dim=0)
         train_input_ids = torch.repeat_interleave(train_input_ids, repeats=self.num_epochs, dim=1)
         eval_input_ids = input_ids[:self.eval_datasize].unsqueeze(dim=0)
+
         train_labels = labels[self.eval_datasize : self.train_datasize + self.eval_datasize].unsqueeze(dim=0)
         train_labels = torch.repeat_interleave(train_labels, repeats=self.num_epochs, dim=1)
         eval_labels = labels[:self.eval_datasize].unsqueeze(dim=0)
+
         assert train_input_ids.shape == train_labels.shape
         assert eval_input_ids.shape == eval_labels.shape
         print(f'the size of training data: {train_input_ids.shape[1]}, the size of eval data: {eval_input_ids.shape[1]}')
@@ -203,8 +217,13 @@ class ZhihuDataset(PretrainDataset):
         with open(self.data_path, 'r') as f:
             for l in f:
                 d = json.loads(l)
-                all_data.append(d['text'])
-                char_count += len(d['text'])
+                qa = self.template.apply(d['question'], d['response'])
+                if len(qa['question'] + qa['answer']) > 1024 * 4:
+                    continue
+
+                all_qa.append(qa)
+                char_count += len(qa['question'] + qa['answer'])
+
                 if char_count >= max_length:
                     break
         return '\n\n'.join(all_data)
