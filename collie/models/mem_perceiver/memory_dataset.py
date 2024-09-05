@@ -25,8 +25,8 @@ class Template:
 
 class Llama3_1Template():
     def __init__(self, tokenizer):
-        self.start_header = '<|begin_of_text|'
-        self.end_header = '<|end_header_id|'
+        self.start_header = '<|start_header_id|>'
+        self.end_header = '<|end_header_id|>'
         self.end_token = '<|eot_id|>'
         self.tokenizer = tokenizer
     
