@@ -22,8 +22,6 @@ class Template:
             return Llama2Template(tokenizer)
         elif model_name == 'falcon-mamba':
             return MambaTemplate(tokenizer)
-        elif model_name == 'recurrent-gemma':
-            return RecurrentGemmaTemplate(tokenizer)
 
 class Llama3_1Template():
     def __init__(self, tokenizer):
@@ -70,21 +68,7 @@ class MambaTemplate():
         return 'user: ' + question + '\n' + self.start_token + 'assistant: ' + answer + self.end_token
     
     def get_answer_indices(self, input_ids):
-        return extract_span_indices(input_ids, start_tag=self.tokenizer.encode(self.start_token)[0], end_tag=self.tokenizer.encode(self.end_token)[0])
-
-class RecurrentGemmaTemplate():
-    def __init__(self, tokenizer):
-        self.start_token = '<start_of_turn>'
-        self.end_token = '<end_of_turn>'
-        self.tokenizer = tokenizer
-    
-    def apply(self, question, answer):
-        return 'user: ' + question + '\n' + self.start_token + 'assistant: ' + answer + self.end_token
-
-    def get_answer_indices(self, input_ids):
-        # print(self.tokenizer.encode(self.start_token)[1])
-        # print(self.tokenizer.encode(self.end_token)[1])
-        return extract_span_indices(input_ids, start_tag=self.tokenizer.encode(self.start_token)[1], end_tag=self.tokenizer.encode(self.end_token)[1])
+        return extract_span_indices(input_ids, start_tags=self.tokenizer.encode(self.start_token), end_tags=self.tokenizer.encode(self.end_token))
 
 class Dataset():
     def __init__(self, model_name, train_datasize, eval_datasize, num_epochs, data_path=None, data_name=None, seed=None):
