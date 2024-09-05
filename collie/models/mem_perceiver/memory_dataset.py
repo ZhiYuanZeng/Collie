@@ -2,7 +2,8 @@ import torch
 import json
 import random
 from transformers import AutoTokenizer
-from parallel_tokenizer import ParallelTokenizer
+# from parallel_tokenizer import ParallelTokenizer
+from .parallel_tokenizer import ParallelTokenizer
 
 class Template:
     """
@@ -16,12 +17,14 @@ class Template:
     
     @classmethod
     def get_template(cls, model_name, tokenizer):
-        if model_name == 'llama3-1':
+        if model_name == 'llama3':
             return Llama3_1Template(tokenizer)
         elif model_name == 'llama2':
             return Llama2Template(tokenizer)
         elif model_name == 'falcon-mamba':
             return MambaTemplate(tokenizer)
+        else:
+            raise NotImplementedError
 
 class Llama3_1Template():
     def __init__(self, tokenizer):
@@ -197,13 +200,12 @@ class MTOBDataset(PretrainDataset):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self.data_path is None:
-            self.data_path = "./mtob_book.json"
+            self.data_path = "/remote-home1/zyzeng/data/mtob_book.json"
         self.data_name = 'MTOB'
     
     def read_raw_data(self, max_length=1024 * 1024 * 8):
         with open(self.data_path, 'r') as f:
             text = f.read()
-        # print('num tokens of MTOB:', len(self.tokenizer.encode(text)))
         return text[:max_length]
 
 class OpenOrcaDataset(SFTDataset):
@@ -306,21 +308,7 @@ class OpenHermos(SFTDataset):
                     break
         return all_qa
 
-def extract_span_indices(lst, start_tag='[start]', end_tag='[end]'):
-    spans = []
-    inside_span = False
-    start_index = None
 
-    for i, item in enumerate(lst):
-        if item == start_tag:
-            inside_span = True
-            start_index = i
-        elif item == end_tag:
-            inside_span = False
-            spans.append((start_index, i))
-        elif inside_span:
-            continue
-    return spans
 
 def divide_list_into_chunks(lst, chunk_size):
     chunks = []
