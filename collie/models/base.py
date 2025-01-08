@@ -372,7 +372,9 @@ class CollieModelForCausalLM(nn.Module, GenerationMixin):
         在生成过程中更新 ``input_ids``、``attention_mask`` 等输入参数的函数。
         """
         if past_key_values is not None:
-            input_ids = input_ids[:, -1:]
+            past_key_values_len = past_key_values[0][0].shape[1]
+            print(past_key_values_len, input_ids.shape, flush=True)
+            input_ids = input_ids[:, past_key_values_len:]
         return {
             "input_ids": input_ids, "attention_mask": attention_mask,
             "use_cache": use_cache, "past_key_values": past_key_values

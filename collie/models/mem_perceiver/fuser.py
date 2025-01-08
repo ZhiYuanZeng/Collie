@@ -21,6 +21,10 @@ from peft import get_peft_model
 from collie.utils.peft_utils import load_peft
 
 
+class FuserType:
+    PERCEIVER='perceiver'
+    LLM='llm'
+
 class AutoFuser:
     @staticmethod
     def from_pretrained(fuser_type, pretrained_model_name_or_path, config, perceiver_path):
@@ -134,17 +138,17 @@ class LLMFuser(TovaPruner):
     def from_pretrained(cls, model_path_or_name: str, config: CollieConfig, perceiver_path=None, **kwargs):
         # TODO: get lora config from args
         model = build_llm_from_name_or_path(model_path_or_name, config)
-        mem_perceiver = cls.from_config(config=config, model=model) # wrapper does not need peft
+        mem_perceiver = cls.from_config(config=config, model=model)
         peft_config = LoraConfig(
             base_model_name_or_path=model_path_or_name,
-            r=8,
-            lora_alpha=32,
+            r=128,
+            lora_alpha=256,
             target_modules=[
                 "q_proj",
                 "v_proj",
                 "k_proj",
             ],
-            lora_dropout=0.1,
+            lora_dropout=0.3,
             bias="none",
             task_type=TaskType.CAUSAL_LM,
             modules_to_save=["embed_tokens"]
@@ -154,40 +158,33 @@ class LLMFuser(TovaPruner):
 
         mem_perceiver.print_trainable_parameters()
         print('Trainable parameters:...............')
-        for n,p in mem_perceiver.named_parameters():
-            if p.requires_grad:
-                print(n)
+        if env.rank == 0:
+            for n,p in mem_perceiver.named_parameters():
+                if p.requires_grad:
+                    print(n)
         if perceiver_path is not None:
             load_peft(mem_perceiver, config, perceiver_path)
         return mem_perceiver
-
-    @staticmethod
-    def save_parallel_state_dict(state_dict: dict,
-        path: str,
-        config,
-        process_exclusion: bool = False,
-        protocol: str = "file",
-    ):
-        if env.rank == 0:
-            embed_state_dict = {}
-            for k,v in state_dict.items():
-                embed_state_dict[k] = v
-            
-            torch.save(embed_state_dict, path + '/embed_weights.bin')
-
-    @staticmethod
-    def load_parallel_state_dict(path:str):
-        state_dict = torch.load(path + '/embed_weights.bin', map_location='cpu')
-        return state_dict
             
     def frozen_model(self):
         # peft would frozen the model automatically
         pass
 
+    def get_lm_head(self):
+        # do not allow resize_token_embeddings to resize lm_head
+        return None, None
+
     def agument_embedding(self):
         vocab_size = self.model.config.vocab_size
         self.memory_token_offset = vocab_size
-        self.model.resize_token_embeddings(vocab_size + 1)
+        if env.rank == 0:
+            print('before agumenting:')
+            print(self.model)
+            setattr(self.model, 'get_lm_head', self.get_lm_head)
+        self.model.resize_token_embeddings(vocab_size + self.query_len)
+        if env.rank == 0:
+            print('after agumenting:')
+            print(self.model)
         # self.memory_token_embed = nn.Embedding(self.chunk_size, embedding_dim=self.config.hidden_size)
 
     def read_and_write_memory(self, compress_func, **kwargs_of_compress_func):
@@ -262,11 +259,11 @@ class LLMFuser(TovaPruner):
 
     def llm_forward(self, keys, values, target_len):
         bsz = keys[0].shape[0]
-        # if target_len > self.query_len:
-        #     mem_token_ids = self.repeat_elements(range(self.query_len), target_len) # repeat mem token id to construct seq of length of target len
-        # else:
-        #     mem_token_ids = range(target_len)
-        mem_token_ids = [0 for _ in range(target_len)]
+        if target_len > self.query_len:
+            mem_token_ids = self.repeat_elements(range(self.query_len), target_len) # repeat mem token id to construct seq of length of target len
+        else:
+            mem_token_ids = range(target_len)
+        # mem_token_ids = [0 for _ in range(target_len)]
         input_ids = torch.tensor(mem_token_ids, device=keys[0].device) + self.memory_token_offset
         input_ids = input_ids.view(1, -1).expand(bsz, target_len)
         past_key_values = torch.stack([torch.stack([ck,cv], dim=0) for ck, cv in zip(keys, values)], dim=0)
@@ -323,6 +320,7 @@ class LLMFuser(TovaPruner):
         new_keys = [k[:, -target_len:] for k in new_keys]
         new_values = [v[:, -target_len:] for v in new_values]
         if double_compress:
+            # FIXME: 实现真正的double compression
             double_compressed_keys = [k[:, -self.compressed_chunk_size:] for k in new_keys]
             double_compressed_values = [v[:, -self.compressed_chunk_size:] for v in new_values]
             return new_keys, new_values, double_compressed_keys, double_compressed_values

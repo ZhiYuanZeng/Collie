@@ -39,7 +39,9 @@ class PrunerType:
     PERCEIVER="perceiver"
     ROCO="roco"
     CONV="conv"
-    all_pruners = [H2O, STREAMING, CHUNK_PREFIX, TOVA, RANDOM, LOCAL_WINDOW, NO_COMPRESS, PERCEIVER, ROCO, CONV]
+    RANDOM_QUERY='random_query'
+    ONLINE_KMEANS_QUERY='online_kms'
+    all_pruners = [H2O, STREAMING, CHUNK_PREFIX, TOVA, RANDOM, LOCAL_WINDOW, NO_COMPRESS, PERCEIVER, ROCO, CONV, RANDOM_QUERY, ONLINE_KMEANS_QUERY]
 
 # class IncrementalType:
 #     LINEAR="linear"
@@ -98,24 +100,21 @@ class AutoPruner:
             config.use_flash = False
             print('Warning: the conv pruner requires attention scores, therefore the flash_attention is set to False!')
             pruner = ConvPruner.from_pretrained(pretrained_model_name_or_path, config)
-        # parameters required
-        elif pruner_type == PrunerType.PERCEIVER:
-            pruner = PerceiverPruner.from_pretrained(pretrained_model_name_or_path, config, perceiver_path)
+        elif pruner_type == PrunerType.RANDOM_QUERY:
+            pruner = RandomQueryPruner.from_pretrained(pretrained_model_name_or_path, config)
+        elif pruner_type == PrunerType.ONLINE_KMEANS_QUERY:
+            pruner = OnlineKmeansPruner.from_pretrained(pretrained_model_name_or_path, config)
         else:
             raise NotImplementedError(f"the {pruner_type} is not supported")
-        if pruner_type in (PrunerType.H2O):
-            assert config.mem_perceiver_config['memory_type'] in (MemoryType.CHUNK_STREAMING, MemoryType.DYNAMIC_INCREMENTAL)
 
         return pruner
 
 class TovaPruner(CollieModelForCausalLM):
-    def __init__(self, config, chunk_size, compressed_chunk_size=None, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, memory_size_limit=None, incremental_type='linear', eval_len=None, decremental_chunk=False, review_scheduler=None, **kwargs):
+    def __init__(self, config, chunk_size=None, model=None, num_sink_tokens=None, num_layers=None, memory_type=None, memory_size_limit=None, 
+                 incremental_type='linear', decremental_chunk=False, review_scheduler=None, **kwargs):
         super().__init__(config)
         self.model = model
         self.chunk_size = chunk_size
-        if compressed_chunk_size is not None:
-            print('warning! the compressed_chunk_size is ignored, it is set according to the memory size/compress ratio. it will be delete from args in the future')
-        self.compressed_chunk_size = None
         # assert memory_size_limit is not None or compress_ratio is not None, "memory_size_limit or compress_ratio must be set!"
         # assert memory_size_limit is None or compress_ratio is None, "memory_size_limit and compress_ratio can not be set at the same time!"
         
@@ -126,9 +125,9 @@ class TovaPruner(CollieModelForCausalLM):
         self.num_layers = num_layers
         self.memory_type = memory_type
         self.memory_size_limit = memory_size_limit
-        self.eval_len = eval_len
         self.decremental_chunk = decremental_chunk
         self.transpose_kv = False
+        self._supports_cache_class = True
 
         assert memory_size_limit is not None
         self.incremental_type = incremental_type
@@ -206,10 +205,6 @@ class TovaPruner(CollieModelForCausalLM):
         topk_indices = topk_indices.to(key.device)
         if self.memory_type != MemoryType.FIXED_INCREMENTAL:
             self.memory_state.update_state(seq_len, self.prefill_len, topk_indices, chunk_step, layer_idx, attention)
-        # self.memory_state.update_memory_usage(seq_len=seq_len, layer_idx=layer_idx, chunk_step=chunk_step, attention_scores=attention)
-        # self.memory_state.update_keep_memory_rate(topk_indices, layer_idx, chunk_step) # it must be before update_cached_indices
-        # self.memory_state.update_cached_indices(seq_len, topk_indices, chunk_step, layer_idx)
-        # self.memory_state.update_cached_freqs(seq_len, topk_indices, chunk_step, layer_idx)
         topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, num_heads, target_len, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
         topk_indices = topk_indices.transpose(1, 2) # (bsz, num_heads, target_len, head_dim) -> (bsz, target_len, num_heads, head_dim)
         
@@ -347,16 +342,11 @@ class TovaPruner(CollieModelForCausalLM):
         """
         seq_len = input_ids.shape[1]
         if seq_len > 1:
-            if self.eval_len is not None:
-                seq_len = seq_len - self.eval_len
-            
             if self.decremental_chunk and self.memory_type == MemoryType.DYNAMIC_INCREMENTAL:
                 chunk_sizes = self.chunksize_scheduler.get_decremental_chunk_sizes(seq_len, self.memsize_scheduler)
             else:
                 chunk_sizes = self.chunksize_scheduler.get_std_chunk_sizes(seq_len)
             
-            if self.eval_len is not None:
-                chunk_sizes += [self.eval_len]
             chunked_input_ids = torch.split(input_ids, chunk_sizes, dim=1)
             if labels is not None:
                 chunked_labels = torch.split(labels, chunk_sizes, dim=1)
@@ -471,17 +461,7 @@ class TovaPruner(CollieModelForCausalLM):
     @classmethod
     def from_pretrained(cls, model_path_or_name: str, config: CollieConfig, perceiver_path=None, **kwargs):
         model = build_llm_from_name_or_path(model_path_or_name, config)
-        if perceiver_path is not None:
-            try:
-                load_config = CollieConfig.from_pretrained(perceiver_path, trust_remote_code=True)
-                config.mem_perceiver_config['query_len'] = load_config.mem_perceiver_config['query_len']
-            except Exception:
-                pass
-            mem_perceiver = cls.from_config(config=config, model=model)
-            state_dict = cls.load_parallel_state_dict(perceiver_path)
-            mem_perceiver.load_state_dict(state_dict)
-        else:
-            mem_perceiver = cls.from_config(config=config, model=model)
+        mem_perceiver = cls.from_config(config=config, model=model)
         if 'internlm' in model_path_or_name.lower():
             mem_perceiver.transpose_kv = True
         return mem_perceiver
@@ -522,8 +502,8 @@ class ChunkPrefix(TovaPruner):
         return indices.unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, target_len)
 
 class ConvPruner(TovaPruner):
-    def __init__(self, config, chunk_size, compressed_chunk_size=0, model=None, num_sink_tokens=0, num_layers=0, memory_type=None, kernel_size=5, **kwargs):
-        super().__init__(config, chunk_size, compressed_chunk_size, model, num_sink_tokens, num_layers, memory_type, **kwargs)
+    def __init__(self, config, kernel_size=5, **kwargs):
+        super().__init__(config, **kwargs)
         self.kernel_size = kernel_size
         assert kernel_size % 2 != 0
 
@@ -579,6 +559,108 @@ class ROCOPruner(TovaPruner):
         important_indices, _ = torch.sort(important_indices, dim=-1) # 方便位置编码
 
         return important_indices
+
+class RandomQueryPruner(TovaPruner):
+    def __init__(self, config, d_model=None, num_querys=128, **kwargs):
+        super().__init__(config, **kwargs)
+        self.query = torch.randn([num_querys, d_model])
+    
+    def compress_layer(self, key, value, attention, target_len, chunk_step, layer_idx, survive_indices=None):
+        if key.shape[1] <= target_len:
+            return key, value
+        bsz, seq_len, num_heads, head_dim = key.shape
+        if attention is None:
+            attention_shape = [bsz, num_heads, seq_len, seq_len]
+        else:
+            attention_shape = list(attention.shape)
+            assert attention_shape[-1] == seq_len
+        if num_heads * head_dim == self.query.shape[-1]:
+            # mha
+            query = self.query.view(-1, num_heads, head_dim)
+        else:
+            # gqa
+            num_querys = self.query.shape[0]
+            query = self.query.view(num_querys, -1, num_heads, head_dim)[:, 0]
+        if query.device != key.device or query.dtype != key.dtype:
+            query = query.to(key)
+        attention_scores = torch.einsum('qhd,bshd -> bqsh', query, key) # (bsz, query_length, key_length, num_heads)  
+        attention_scores = attention_scores / (head_dim ** 0.5)
+        attention_scores = torch.softmax(attention_scores, dim=2) 
+        attention_scores = attention_scores.sum(dim=1) # (bsz, key_length, num_heads)  
+        topk_indices = torch.topk(attention_scores, dim=1, k=target_len, largest=True).indices # (bsz, target_len, num_heads, )
+        topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, target_len, num_heads, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
+        selected_keys = torch.gather(key, index=topk_indices, dim=1)
+        selected_values = torch.gather(value, index=topk_indices, dim=1)
+
+        return selected_keys, selected_values
+
+class OnlineKmeansPruner(TovaPruner): 
+    """
+    参考sklearn的实现：
+    - 初始化：随机从样本中sample簇中心
+    - assignment: 计算样本assign的簇中心
+    - update: 利用移动滑动平均更新簇中心
+    """
+    def __init__(self, config, d_model=None, num_querys=128, **kwargs):
+        super().__init__(config, **kwargs)
+        self.query = None
+        self.count = None
+        self.num_querys = num_querys
+    
+    def init_query(self, key):
+        bsz, seq_len, num_heads, head_dim = key.shape
+        key = key.view(-1, num_heads, head_dim) # bsz和seq_len被认为是一个维度，或者说batch_size应该是1
+        query = []
+        for head_idx in range(num_heads):
+            indices = torch.randperm(bsz * seq_len)[:self.num_querys]
+            selected_key = key[indices, head_idx] # (num_querys, head_dim)
+            query.append(selected_key)
+        self.query = torch.stack(query, dim=1) # (num_querys, num_heads, head_dim)
+        self.count = torch.zeros(self.num_querys, num_heads, 1).to(self.query)
+
+    def assign_key(self, key):
+        bsz, seq_len, num_heads, head_dim = key.shape
+        key = key.view(-1, num_heads, head_dim) # bsz和seq_len被认为是一个维度，或者说batch_size应该是1
+        distances = torch.linalg.norm(self.query.unsqueeze(dim=0) - key.unsqueeze(dim=1), axis=-1) # (bsz*seq_len, num_querys, num_heads)
+        closest_centroid_idx = torch.argmin(distances, dim=1) # (bsz*seq_len, num_heads)
+        return closest_centroid_idx
+
+    def update_query(self, key, labels):
+        bsz, seq_len, num_heads, head_dim = key.shape
+        key = key.view(-1, num_heads, head_dim)
+        # labels: (bsz * seq_len, num_heads)
+        # keys: (bsz*seq_len, num_heads, head_dim)
+        # query: (num_querys, num_heads, head_dim)
+        new_count = (labels.unsqueeze(dim=0) == torch.arange(self.num_querys).unsqueeze(dim=-1).unsqueeze(dim=-1).expand(self.num_querys, bsz*seq_len, num_heads).to(labels)) 
+        new_count = new_count.sum(dim=1).unsqueeze(dim=-1)
+
+        labels = labels.unsqueeze(dim=-1).expand(bsz * seq_len, num_heads, head_dim)
+        new_query = self.query * self.count
+        new_query = torch.scatter_add(dim=0, index=labels, input=new_query, src=key)
+        # (1, bsz*seq_len, num_heads) == (num_querys, 1, 1) => (num_querys, bsz*seq_len, num_heads)
+        self.query = new_query / new_count
+        self.count = new_count
+
+    def compress_layer(self, key, value, attention, target_len, chunk_step, layer_idx, survive_indices=None):
+        if key.shape[1] <= target_len:
+            return key, value
+        bsz, seq_len, num_heads, head_dim = key.shape
+        
+        if self.query is None:
+            self.init_query(key)
+        labels = self.assign_key(key)
+        self.update_query(key, labels)
+
+        attention_scores = torch.einsum('bshd,qhd -> bsqh', key, self.query) # (bsz, key_length, query_length, num_heads)  
+        assert not torch.any(torch.isinf(self.query)) and not torch.any(torch.isnan(self.query))
+        attention_scores = attention_scores / (head_dim ** 0.5)
+        attention_scores = torch.softmax(attention_scores, dim=1) 
+        attention_scores = attention_scores.sum(dim=2) # (bsz, key_length, num_heads)  
+        topk_indices = torch.topk(attention_scores, dim=1, k=target_len, largest=True).indices # (bsz, target_len, num_heads, )
+        topk_indices = topk_indices.unsqueeze(dim=-1).expand(bsz, target_len, num_heads, head_dim) # (bsz, num_heads, target_len, 1) -> (bsz, num_heads, target_len, head_dim)
+        selected_keys = torch.gather(key, index=topk_indices, dim=1)
+        selected_values = torch.gather(value, index=topk_indices, dim=1)
+        return selected_keys, selected_values
 
 class PerceiverPrunerLayer(nn.Module):
     def __init__(self, query_len, compressed_chunk_size, d_query, d_model, chunk_size, temperature) -> None:

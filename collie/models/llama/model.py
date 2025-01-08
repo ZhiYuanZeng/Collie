@@ -535,6 +535,7 @@ class LlamaForCausalLM(CollieModelForCausalLM):
         if config.model_config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
         self.main_input_name = "input_ids"
+        self._supports_cache_class = True
 
     def forward(
         self,
