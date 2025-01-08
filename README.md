@@ -1,355 +1,105 @@
-<div align="center">
- <img src="docs/assets/images/banner.png">
-</div>
+# Memorize Step by Step
+Implementation for the paper "Memorize Step by Step: Efficient Long-Context Prefilling with Incremental Memory and Decremental Chunk" 
+(https://aclanthology.org/2024.emnlp-main.1169/)
 
-# CoLLiE
+## Features
+将序列划分成多个chunk，并迭代压缩chunk，支持无限长输入的prefill。
+- 将LLM和Compresser解耦，因此无需为模型定制Compresser，只要模型输出包含KV Cache，attention scores就能使用本框架
+- 支持多种Compresser，目前支持的都是kv-cache pruner
+- 支持多种Memory管理，例如Chunk_Streaming: 固定memory大小，每次压缩一个chunk都刷新memory
 
-CoLLiE (Collaborative Tuning of Large Language Models in an Efficient Way)，一个帮助您从零开始训练大模型的完整工具箱。
+## Compresser
+支持的Compressers:
+Pruner: pruner保留一部分kv cache，注意很多kv cache压缩方法需要attention scores，以至于无法使用flash attention。导致压缩后的速度可能反而更慢，显存反而更多。
 
-
-[![Github Repo Stars](https://img.shields.io/github/stars/openlmlab/collie?style=social)](https://github.com/openlmlab/collie/stargazers)
-[![GitHub](https://img.shields.io/github/license/OpenLMLab/collie)]()
-[![Doc](https://img.shields.io/badge/Website-Doc-blue)](https://openlmlab-collie.readthedocs.io/zh_CN/latest/)
-[![HuggingFace badge](https://img.shields.io/badge/%F0%9F%A4%97HuggingFace-Join-yellow)](https://huggingface.co/openlmlab)
-[![GitHub Workflow Status (with event)](https://img.shields.io/github/actions/workflow/status/OpenLMLab/collie/python-publish.yml)](https://pypi.org/project/collie-lm/)
-[![GitHub commit activity (branch)](https://img.shields.io/github/commit-activity/w/OpenLMLab/collie)](https://github.com/OpenLMLab/collie/commits/main)
-[![GitHub issues](https://img.shields.io/github/issues/OpenLMLab/collie)](https://github.com/OpenLMLab/collie/issues)
-
-<h4 align="center">
-  <p>
-     [ <a href="https://github.com/OpenLMLab/collie/blob/dev/README.md">简体中文</a> ] |
-     [ <a href="https://github.com/OpenLMLab/collie/blob/dev/README_EN.md">English</a> ]
-  </p>
-</h4>
-
-
-## 新闻
-- [2023/12] 🎉 CoLLiE被EMNLP System Demonstrations接收：[CoLLiE: Collaborative Training of Large Language Models in an Efficient Way](https://arxiv.org/abs/2312.00407)
-- [2023/08] 评测结果新增[显存占用与模型大小的关系](#显存占用)和[吞吐量](#吞吐量)。
-- [2023/07] 发布Python包`collie-lm`。您可以在[PyPI](https://pypi.org/project/collie-lm/#history)中查看更多细节！
-
-## 目录
-<ul>
-    <li><a href="#为什么选择CoLLiE">为什么选择CoLLiE</a></li>
-    <li><a href="#特性">特性</a></li>
-    <li><a href="#CoLLiE支持的模型">CoLLiE支持的模型</a></li>
-    <li><a href="#评测">评测</a></li>
-    <li><a href="#安装">安装</a></li>
-    <li><a href="#Docker安装">Docker安装</a></li>
-    <li><a href="#使用">使用</a>
-        <ul>
-            <li><a href="#快速开始">快速开始</a></li>
-            <li><a href="#有趣的插件">有趣的插件</a></li>
-            <li><a href="#更多成功样例和完整教程">更多成功样例和完整教程</a></li>
-        </ul>
-    </li>
-    <li><a href="#社区">社区</a></li>
-    <li><a href="#贡献者">贡献者</a></li>
-    <li><a href="#引用我们">引用我们</a></li>
-</ul>
-
-## 为什么选择CoLLiE
-CoLLiE是一个可以帮助您从零开始训练大模型的完整工具箱，它提供了数据预处理、模型微调、模型保存以及训练过程各项指标监测等功能。CoLLiE集成了现有的并行策略、高效参数微调方法和高效优化器，以加快训练的速度，提高训练的质量，降低训练的开销。CoLLiE支持主流的多种模型（如MOSS, InternLM, LLaMA, ChatGLM等），您可以轻松在不同的模型之间切换。此外，CoLLiE提供了丰富的文档，使初学者可以快速入门。同时，CoLLiE还提供了高度可定制化的功能和灵活的配置选项，使有经验的用户能够根据自己的需求进行个性化定制。无论您是初学者还是有经验的专业人士，CoLLiE都可以为您提供满足需求的解决方案。
-
-## 特点
-
-CoLLiE 基于 *DeepSpeed* 和 *PyTorch*，为大型语言模型提供协作式和高效的调优方法。
-它主要包括以下四个特点：
-
-<div align="center">
-    <img src="docs/assets/images/feature_list.png" width="800px">
-</div>
-
-- 并行策略
-  - 数据并行 (DP)
-  - [流水线并行 (PP)](https://arxiv.org/pdf/1811.06965.pdf)
-  - [张量并行 (TP)](https://arxiv.org/pdf/2104.04473.pdf)
-  - [零冗余优化器 (ZeRO)](https://arxiv.org/pdf/1910.02054.pdf)
-- 高效微调
-  - [LOMO](https://arxiv.org/pdf/2306.09782.pdf)
-  - [LoRA](https://arxiv.org/pdf/2106.09685.pdf)
-  - [Flash Attention](https://arxiv.org/pdf/2205.14135.pdf)
-- 设计优雅
-- 用户友好
-
-<details>
-  <summary>完整特性</summary>
-  <div align="center">
-      <img src="docs/assets/images/features.svg" width="800px">
-  </div>
-</details>
-
-## CoLLiE支持的模型
-- MOSS系列：[MOSS-MOON](https://github.com/OpenMOSS/MOSS)
-- InternLM系列：[InternLM2](https://github.com/InternLM/InternLM)
-- LLaMA系列：[LLaMA](https://github.com/meta-llama/llama)、[LLaMA-2](https://github.com/meta-llama/llama)
-- ChatGLM系列：[ChatGLM](https://github.com/THUDM/ChatGLM2-6B)、[ChatGLM2](https://github.com/THUDM/ChatGLM2-6B)
-
-
-## 评测
-
-### 显存占用
-使用张量并行测试了批量大小为 1，序列长度为 2048，梯度累计步数为 2 下显存占用情况，结果如下：
-
-<img src="docs/assets/images/mem_req.png" width="400px">
-
-### 吞吐量
-在 A100 和 RTX-3090 上测试了不同批量大小下使用 Adam 优化器的吞吐量，结果如下：
-
-<img src="docs/assets/images/throughput.png" width="800px">
-
-## 安装
-在安装前，你需要确保：
-* PyTorch >= 1.13
-* CUDA >= 11.6 
-* Linux OS
-### PyPI安装
-你可以简单地通过PyPI安装，命令如下：
-```bash
-pip install collie-lm
-```
-### 源码安装
-```bash
-git clone https://github.com/OpenLMLab/collie
-python setup.py install
-```
-
-## Docker安装
-
-## 使用
-
-### 快速开始
-
-下面将提供一个使用CoLLiE训练Moss的样例，同时使用LOMO优化器，并且开启ZeRO3来降低显存消耗。
-
-那么，请按照下面的步骤开启你的大模型训练之旅吧~ 
-<img src="docs/assets/images/mario-running.gif" height="50px"/>
-
-#### 第一步：导入必要的包
 ```python
-from transformers import AutoTokenizer
-from collie.config import CollieConfig
-from collie.data import CollieDatasetForTraining
-from collie.data import CollieDataLoader
-from collie.optim.lomo import Lomo
-from collie.controller.trainer import Trainer
-from collie.controller.evaluator import EvaluatorForPerplexity, EvaluatorForGeneration
-from collie.models.moss_moon import Moss003MoonForCausalLM
-from collie.utils.monitor import StepTimeMonitor, TGSMonitor, MemoryMonitor, LossMonitor, EvalMonitor
-from collie.metrics import DecodeMetric, PPLMetric
-from collie.module import GPTLMLoss
-from collie.utils.data_provider import GradioProvider
+class PrunerType:
+    H2O="h2o"
+    STREAMING="streaming_llm"
+    CHUNK_PREFIX="chunk_prefix"
+    TOVA="tova"
+    RANDOM="random"
+    LOCAL_WINDOW="local_window"
+    NO_COMPRESS="no_compress"
+    PERCEIVER="perceiver"
+    ROCO="roco"
+    CONV="conv"
 ```
 
-#### 第二步：设置路径
-选择预训练模型为MOSS
-```
-pretrained_model = "fnlp/moss-moon-003-sft"
-```
+需要attention scores的pruning方法：
+- H2O
+- TOVA
+- ROCO
+- CONV
 
-#### 第三步：设置CoLLiE配置
+不需要attention scores的pruning方法：
+- Streaming
+- Chunk_Prefix
+- RANDOM
+- LOCAL_WINDOW
+- NO_COMPRESS
+
+## Memory
+支持的memory类型：
 ```python
-config = CollieConfig.from_pretrained(pretrained_model, trust_remote_code=True)
-# 张量并行
-config.tp_size = 2
-# 数据并行
-config.dp_size = 1
-# 流水线并行
-config.pp_size = 1
-# 训练的epoch数量
-config.train_epochs = 1
-# 每{100}个step进行一次eval
-config.eval_per_n_steps = 100
-# 每{1}个epoch进行一次eval
-config.eval_per_n_epochs = 1 
-# 每个GPU的batch_size设置为{16}
-config.train_micro_batch_size = 16
-# 每次eval的batch_size为{1}
-config.eval_batch_size = 1
-# 设置DeepSpeed配置
-config.ds_config = {
-        # 开启FP16
-        "fp16": {
-            "enabled": True
-        },
-        "zero_allow_untested_optimizer": True,
-        "zero_force_ds_cpu_optimizer": False,
-        # 开启ZeRO-3
-        "zero_optimization": {
-            "stage": 3,
-            "offload_optimizer": {
-                "device": "cpu",
-                "pin_memory": False
-            }
-        },
-        "monitor_config": {
-            "enabled": True,
-            "tag": "adan",
-            "csv_monitor": {
-                "enabled": True,
-                "output_path": "./ds_logs/"
-            }
-        }
+class MemoryType:
+    CHUNK_STREAMING="FM"
+    DualMemory="dual_memory"
+    FIXED_INCREMENTAL="Incremental_Chunk_Streaming_Fixed_History"
+    DYNAMIC_INCREMENTAL="IM"
+    DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS="dynamic_incremental_double_compress"
+    RETRIEVE_INCREMENTAL="Incremental_Chunk_Streaming_Retrieved_History"
+    RETRIEVE_ALL_KV="Cache_All_KV_Retrieve_History"
+```
+
+- CHUNK_STREAMING: 固定memory大小，每次压缩新的chunk更新Memory
+- FIXED_INCREMENTAL: 每次压缩新的chunk会在原有memory的基础上拼接
+- DYNAMIC_INCREMENTAL: 每次压缩新的chunk，会刷新memory，并且增加memory size
+- DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS: 每次压缩新的chunk，会刷新memory，并且增加memory size，但是还会对memory再做一次压缩，第二次压缩的结果会输入LLM
+
+## Usage
+参考
+`tests/models/mem_perceiver/test_decoding.py`
+
+```python
+# 创建collie config
+config = CollieConfig.from_pretrained(llm_name_or_path,
+        trust_remote_code=True)
+config.checkpointing = True
+config.use_flash = True
+# 创建compresser config
+mem_perceiver_config = {
+    # llm config，从llm config获取
+    "d_model": d_model,
+    "num_heads": num_heads,
+    "num_layers": num_layers,
+
+    # custom config，需要自定义的参数
+    "memory_type": MemoryType.DYNAMIC_INCREMENTAL, # 选择哪种memory
+    "chunk_size": chunk_size, # 滚动压缩的chunk size
+    "compressed_chunk_size": compressed_chunk_size, # 每个chunk压缩后的长度 
+    "query_len": compressed_chunk_size, # 只有perceiver需要这个参数
+    "d_query": d_query, # 只有perceiver需要这个参数，应该设置的小一点
+    "num_sink_tokens": 4, # sink token的数量，参考streaming llm
 }
+# 调用AutoXXX.from_pretrained
+mem_perceiver = AutoPruner.from_pretrained(
+    pruner_type=PrunerType.PERCEIVER,
+    config=config,
+    pretrained_model_name_or_path=llm_name_or_path)
+mem_perceiver.forward(kwargs)
+mem_perceiver.generate(kwargs)
 ```
 
-#### 第四步：设置Tokenizer
-```python
-tokenizer = AutoTokenizer.from_pretrained("fnlp/moss-moon-003-sft", trust_remote_code=True)
-```
+评测ppl:
+`bash examples/mem_perceiver/eval_all_pruners.sh`
 
-#### 第五步：加载数据集
-这里自定义一个数据集，数据格式可以提供两种形式，具体请参考文档。
-```python
-train_dataset = [
-    {
-        'input': 'Collie is a python package for ',
-        'output': 'finetuning large language models.'
-    } for _ in range(10000)
-]
-train_dataset = CollieDatasetForTraining(train_dataset, tokenizer)
-eval_dataset = train_dataset[:32]
-```
+## Memory Probing
+`collie/models/mem_perceiver/utils.py`定义了一些MemoryState，每个MemoryState对应一种Probing，例如MemoryForgive调查的是memory的遗忘曲线
 
-#### 第六步：加载预训练模型
-```python
-model = Moss003MoonForCausalLM.from_pretrained(pretrained_model, config=config)
-```
+以`tests/models/mem_perceiver/test_forgiving.py`为例，调用model.report_memory_state()可以导出各种probing的状态。
 
-#### 第七步：设置优化器
-```python
-optimizer = Lomo(
-    model,
-    lr = 0.001,
-    clip_grad_norm = 5.0
-)
-```
+`tests/models/mem_perceiver/compare_forgiving.ipynb`可视化了memory的遗忘曲线
 
-#### 第八步：添加监视器
-```python
-monitors = [
-    # 每个step用时监测
-    StepTimeMonitor(config),
-    # TGS（每秒生成token数量监测）
-    TGSMonitor(config),
-    # 显存使用情况监测
-    MemoryMonitor(config),
-    # Loss值监测
-    LossMonitor(config),
-    # Eval结果监测
-    EvalMonitor(config)
-]
-```
-
-#### 第九步：添加Evaluator
-这里添加两个Evaluator，分别用于计算PPL(困惑度：Perplexity)和保存Decode结果。
-```python
-evaluator_ppl = EvaluatorForPerplexity(
-    model = model,
-    config = config,
-    dataset = eval_dataset,
-    monitors = [
-        EvalMonitor(config)
-    ],
-    metrics = {
-        'ppl': PPLMetric()
-    }
-)
-evaluator_decode = EvaluatorForGeneration(
-    model = model,
-    config = config,
-    tokenizer = tokenizer,
-    dataset = eval_dataset,
-    monitors = [
-        EvalMonitor(config)
-    ],
-    metrics = {
-        'decode': DecodeMetric()
-    }
-
-)
-```
-
-#### 第十步：实例化Trainer
-```python
-trainer = Trainer(
-    model = model,
-    config = config,
-    loss_fn = GPTLMLoss(-100),
-    optimizer = optimizer,
-    train_dataset = train_dataset,
-    monitors = monitors,
-    evaluators = [evaluator_ppl, evaluator_decode],
-)
-# 开始训练/验证
-trainer.train()
-```
-
-#### 最后一步：启动命令行，开始训练！👍
-```bash
-Command CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --rdzv_backend=c10d --rdzv_endpoint=localhost:29402 --nnodes=1 --nproc_per_node=4 finetune_moss_for_training.py
-```
-如果你的命令行出现如下的进度条，那么恭喜你，你已经成功开始训练你的大模型！
-<div align="center">
- <img src="docs/assets/images/progress.png">
-</div>
-
-完整代码请参考<a href="https://github.com/OpenLMLab/collie/blob/dev/examples/finetune_moss_for_training.py">examples/finetune_moss_for_training.py</a>。
-
-### 有趣的插件
-
-CoLLiE提供了许多即插即用的插件，下面将介绍Monitor检测器和异步DataProvider，更多插件等待探索和开发...
-
-#### Monitor监测器
-在CollieConfig.ds_config中添加monitor配置，并在Trainer中启用即可在训练过程中打开监测器。
-```python
-    "monitor_config": {
-        # 开启检测器
-        "enabled": True,
-        # 保存的文件名前缀
-        "tag": "adan",
-        # 保存文件格式:csv
-        "csv_monitor": {
-            "enabled": True,
-            # 保存文件夹
-            "output_path": "./ds_logs/"
-        }
-    }
-```
-启用检测器后，你将在`ds_logs`文件夹中获取相关的文件，如：
-<div align="center">
- <img src="docs/assets/images/monitor.png">
-</div>
-
-#### 异步DataProvider
-你只需要在Trainer中添加：data_provider，即可在训练过程中打开一个异步DataProvider，方便及时Human Eval！
-```python
-trainer = Trainer(
-    model = model,
-    config = config,
-    loss_fn = GPTLMLoss(-100),
-    optimizer = optimizer,
-    train_dataset = train_dataset,
-    monitors = monitors,
-    evaluators = [evaluator_ppl, evaluator_decode],
-    # 添加
-    data_provider = GradioProvider(tokenizer)
-)
-```
-<div align="center">
- <img src="docs/assets/images/data_provider.png">
-</div>
-
-
-
-### 更多成功样例和完整教程
-CoLLiE提供了完整的 [教程](https://openlmlab-collie.readthedocs.io/zh_CN/latest/)。 更多的示例也可在 [示例](examples) 中查看。
-
-## 社区
-
-## 贡献者
-<a href="https://github.com/Openlmlab/collie/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=Openlmlab/collie" />
-</a>
-
-## 引用我们
+## TODO
+目前的实现和collie绑定，但是其实可以和transformers直接兼容
