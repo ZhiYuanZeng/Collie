@@ -43,19 +43,24 @@ class PrunerType:
 支持的memory类型：
 ```python
 class MemoryType:
-    CHUNK_STREAMING="FM"
-    DualMemory="dual_memory"
-    FIXED_INCREMENTAL="Incremental_Chunk_Streaming_Fixed_History"
-    DYNAMIC_INCREMENTAL="IM"
-    DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS="dynamic_incremental_double_compress"
-    RETRIEVE_INCREMENTAL="Incremental_Chunk_Streaming_Retrieved_History"
-    RETRIEVE_ALL_KV="Cache_All_KV_Retrieve_History"
+    CHUNK_STREAMING="FM" # 固定大小的memory
+    DYNAMIC_INCREMENTAL="IM" # 动态增加memory大小， 每次动态调整Memory会刷新整个memory
+    FIXED_INCREMENTAL="Incremental_Chunk_Streaming_Fixed_History" # 动态增加memory大小，但是只会在之前的基础上拼接新的memory
 ```
+论文提出的方法：
+- IM: 将memory_type设置为"IM"
+- IMDC: 将memory_type设置为"IM"，并在pruner的init函数传入decremental_chunk=True
+- Baseline (FM): 固定Memory大小
 
-- CHUNK_STREAMING: 固定memory大小，每次压缩新的chunk更新Memory
-- FIXED_INCREMENTAL: 每次压缩新的chunk会在原有memory的基础上拼接
-- DYNAMIC_INCREMENTAL: 每次压缩新的chunk，会刷新memory，并且增加memory size
-- DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS: 每次压缩新的chunk，会刷新memory，并且增加memory size，但是还会对memory再做一次压缩，第二次压缩的结果会输入LLM
+## Incremental Type
+```python
+class IncrementalType:
+    LINEAR="linear"
+    SQUARE="square"
+    SQRT="sqrt"
+    INVERSE_CONVEX="inverse_convex"
+    INVERSE_CONCAVE="inverse_concave"
+```
 
 ## Usage
 参考
@@ -75,12 +80,12 @@ mem_perceiver_config = {
     "num_layers": num_layers,
 
     # custom config，需要自定义的参数
-    "memory_type": MemoryType.DYNAMIC_INCREMENTAL, # 选择哪种memory
-    "chunk_size": chunk_size, # 滚动压缩的chunk size
-    "compressed_chunk_size": compressed_chunk_size, # 每个chunk压缩后的长度 
-    "query_len": compressed_chunk_size, # 只有perceiver需要这个参数
-    "d_query": d_query, # 只有perceiver需要这个参数，应该设置的小一点
-    "num_sink_tokens": 4, # sink token的数量，参考streaming llm
+    "memory_type": memory_type, # FM, IM
+    "chunk_size": chunk_size,
+    "num_sink_tokens": 4,
+    "memory_size_limit": memory_size_limit, # memory size
+    "incremental_type": incremental_type, # linear, square, sqrt, inverse_convex, inverse_concave
+    "decremental_chunk": decremental_chunk, # if True, Decrease Chunk iteratively
 }
 # 调用AutoXXX.from_pretrained
 mem_perceiver = AutoPruner.from_pretrained(

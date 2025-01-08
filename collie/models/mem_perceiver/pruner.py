@@ -20,10 +20,10 @@ from collie.module import GPTLMLoss
 import torch.nn.functional as F
 
 class MemoryType:
-    CHUNK_STREAMING="FM"
+    CHUNK_STREAMING="FM" # 固定大小的memory
+    DYNAMIC_INCREMENTAL="IM" # 动态增加memory大小， 每次动态调整Memory会刷新整个memory
+    FIXED_INCREMENTAL="Incremental_Chunk_Streaming_Fixed_History" # 动态增加memory大小，但是只会在之前的基础上拼接新的memory
     DualMemory="dual_memory"
-    FIXED_INCREMENTAL="Incremental_Chunk_Streaming_Fixed_History"
-    DYNAMIC_INCREMENTAL="IM"
     DYNAMIC_INCREMENTAL_DOUBLE_COMPRESS="dynamic_incremental_double_compress"
     RETRIEVE_INCREMENTAL="Incremental_Chunk_Streaming_Retrieved_History"
     RETRIEVE_ALL_KV="Cache_All_KV_Retrieve_History"
